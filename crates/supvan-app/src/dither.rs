@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 /// Thermal-compensated sRGB-to-dither LUT.
 ///
 /// Combines standard sRGB linearization (gamma ~2.2) with a thermal bleed
@@ -49,6 +51,40 @@ pub fn dither_line(line: &[u8], width: u32, y: u32, mono: &mut [u8]) {
     }
 }
 
+/// Flatten one contone scanline to the 8-bit grey [`dither_line`] expects.
+///
+/// CUPS picks the colour space from the URF list the IPP layer advertises
+/// (`W8,SRGB24,…`), so a Ghostscript job arrives as 24-bit sRGB as often as
+/// 8-bit grey — the driver does not get to choose. `None` for a depth that
+/// is not contone; the caller handles 1 bpp or rejects it.
+///
+/// 24 bpp uses the same Rec. 709 weights as `image`'s `to_luma8()`, so a
+/// picture prints identically via raster or JPEG. Always returns exactly
+/// `width` bytes — short lines pad white — so [`dither_line`] can index
+/// `0..width` unchecked.
+pub fn to_gray_line<'a>(bits_per_pixel: u32, line: &'a [u8], width: u32) -> Option<Cow<'a, [u8]>> {
+    match bits_per_pixel {
+        8 if line.len() >= width as usize => Some(Cow::Borrowed(&line[..width as usize])),
+        8 => {
+            let mut padded = vec![0xff; width as usize];
+            padded[..line.len()].copy_from_slice(line);
+            Some(Cow::Owned(padded))
+        }
+        24 => Some(Cow::Owned(
+            (0..width as usize)
+                .map(|x| match line.get(x * 3..x * 3 + 3) {
+                    Some(px) => {
+                        let (r, g, b) = (px[0] as u32, px[1] as u32, px[2] as u32);
+                        ((r * 2126 + g * 7152 + b * 722) / 10000) as u8
+                    }
+                    None => 0xff,
+                })
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +133,51 @@ mod tests {
         let mut mono = vec![0u8; bpl];
         dither_line(&line, 13, 0, &mut mono);
         // Just verify it doesn't panic
+    }
+
+    #[test]
+    fn gray_line_from_rgb_matches_image_crate_weights() {
+        // Pure white / black must survive exactly, or a mostly-white label
+        // dithers to solid ink — which is what a 24 bpp raster fed straight
+        // into the 1-bit page buffer produced.
+        let g = |px: &[u8], w| to_gray_line(24, px, w).unwrap().into_owned();
+        assert_eq!(g(&[0xff, 0xff, 0xff], 1), vec![0xff]);
+        assert_eq!(g(&[0x00, 0x00, 0x00], 1), vec![0x00]);
+        // Rec. 709: green dominates, blue barely registers.
+        assert_eq!(g(&[0, 0xff, 0], 1), vec![182]);
+        assert_eq!(g(&[0, 0, 0xff], 1), vec![18]);
+    }
+
+    #[test]
+    fn gray_line_pads_short_rgb_lines_with_white() {
+        // One complete pixel, then a truncated scanline: the rest must read as
+        // blank paper rather than ink.
+        let out = to_gray_line(24, &[0, 0, 0], 3).unwrap();
+        assert_eq!(&*out, &[0x00, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn gray_line_passes_8bpp_through_and_rejects_other_depths() {
+        let out = to_gray_line(8, &[1, 2, 3, 4], 3).unwrap();
+        assert_eq!(&*out, &[1, 2, 3], "8 bpp is already grey, and is clipped");
+        assert!(to_gray_line(1, &[0xff], 8).is_none());
+        assert!(to_gray_line(16, &[0xff; 4], 2).is_none());
+    }
+
+    #[test]
+    fn gray_line_pads_short_8bpp_lines_with_white() {
+        // A truncated grey scanline must still cover the full width, or
+        // `dither_line` indexes past the end of the slice and panics.
+        let out = to_gray_line(8, &[0x10, 0x20], 4).unwrap();
+        assert_eq!(&*out, &[0x10, 0x20, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn dither_line_survives_short_contone_input() {
+        for bpp in [8, 24] {
+            let input = to_gray_line(bpp, &[0x00], 16).unwrap();
+            let mut mono = vec![0u8; 2];
+            dither_line(&input, 16, 0, &mut mono);
+        }
     }
 }
