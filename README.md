@@ -48,6 +48,17 @@ The model registry lives in
 [`data/models.toml`](data/models.toml) — it is compiled into the binary as a
 fallback and can be overridden at runtime with `SUPVAN_MODELS` (no recompile).
 
+Each family lists the label sizes it advertises. Continuous-tape families (the
+E-series) add a `media_ladder`, which expands at load into a dense range of
+requestable lengths — 4 mm to 1 m for the E10 — so a caller can ask for a
+label sized to its content rather than rounding up to the nearest stock size.
+Rungs must be at least 2 mm apart and a family may advertise at most 400 sizes
+in total — the ladder emits every rung once per width, so it is the
+width × length product that has to fit the budget. Both limits come from
+measured CUPS behaviour and are explained in
+[docs/E10-PROTOCOL.md](docs/E10-PROTOCOL.md) §4.1.2. Die-cut families omit the
+ladder, since their stock only registers at its real sizes.
+
 ## How it works
 
 ```

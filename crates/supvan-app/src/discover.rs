@@ -2,7 +2,7 @@
 //!
 //! 1. Connect to system D-Bus, find adapter
 //! 2. Run a 4-second active BT Classic scan
-//! 3. Auto-pair matching unpaired devices
+//! 3. Auto-pair matching unpaired devices that could speak SPP
 //! 4. Report matching paired devices with SPP UUID
 
 use dbus::blocking::Connection;
@@ -18,14 +18,34 @@ type ManagedObjects = std::collections::HashMap<dbus::Path<'static>, IfaceMap>;
 const SPP_UUID_PREFIX: &str = "00001101-";
 const BLUEZ_SERVICE: &str = "org.bluez";
 
-fn has_spp_uuid(props: &PropMap) -> bool {
+fn uuids(props: &PropMap) -> Vec<String> {
     props
         .get("UUIDs")
         .and_then(|v| v.0.as_iter())
         .into_iter()
         .flatten()
         .filter_map(|item| item.as_str())
-        .any(|uuid| uuid.to_lowercase().starts_with(SPP_UUID_PREFIX))
+        .map(|u| u.to_lowercase())
+        .collect()
+}
+
+fn has_spp_uuid(props: &PropMap) -> bool {
+    uuids(props)
+        .iter()
+        .any(|uuid| uuid.starts_with(SPP_UUID_PREFIX))
+}
+
+/// Whether an *unpaired* device is worth a pairing attempt.
+///
+/// Pairing is intrusive and the generic serial-name fallback in
+/// [`models::is_matching_bt_device`] accepts names no pattern lists, so phase
+/// 4's SPP check gates pairing too — but only where BlueZ knows the profiles.
+/// Before SDP runs an inquiry result carries only what fits in the EIR, often
+/// nothing: an empty list means "unknown", not "no SPP", and refusing on it
+/// would make the printer undiscoverable.
+fn may_speak_spp(props: &PropMap) -> bool {
+    let advertised = uuids(props);
+    advertised.is_empty() || advertised.iter().any(|u| u.starts_with(SPP_UUID_PREFIX))
 }
 
 fn get_str_prop(props: &PropMap, key: &str) -> Option<String> {
@@ -180,7 +200,12 @@ where
         };
 
         let name = get_str_prop(props, "Name").unwrap_or_default();
-        if !models::is_matching_bt_name(&name) {
+        let address = match get_str_prop(props, "Address") {
+            Some(a) => a,
+            None => continue,
+        };
+
+        if !models::is_matching_bt_device(&address, &name) {
             continue;
         }
 
@@ -189,10 +214,10 @@ where
             continue;
         }
 
-        let address = match get_str_prop(props, "Address") {
-            Some(a) => a,
-            None => continue,
-        };
+        if !may_speak_spp(props) {
+            log::debug!("discover: {name} ({address}) — advertises no SPP, not pairing");
+            continue;
+        }
 
         log::info!("discover: found unpaired match: {name} ({address})");
         auto_pair_device(&conn, path, &address);
@@ -231,7 +256,8 @@ where
             continue;
         }
 
-        if !models::is_matching_bt_name(&name) {
+        if !models::is_matching_bt_device(&address, &name) {
+            log::debug!("discover: {name} ({address}) — not a Supvan printer, skipping");
             continue;
         }
 
