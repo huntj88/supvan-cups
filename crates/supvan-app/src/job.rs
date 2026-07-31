@@ -2,20 +2,16 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use ipp_printer_app::{JobFailure, JobOptions, PrinterHandle, PrinterReason, RasterDriver};
-use supvan_proto::bitmap::{DEFAULT_MARGIN_DOTS, center_in_printhead, raster_to_column_major};
+use supvan_proto::bitmap::{center_in_printhead, raster_to_column_major};
 use supvan_proto::buffer::split_into_buffers;
-use supvan_proto::compress::compress_buffers;
 use supvan_proto::error::Error as ProtoError;
-use supvan_proto::speed::calc_speed;
+use supvan_proto::profile::PrintProfile;
 use supvan_proto::status::PrinterStatus;
 
 use crate::dither::{dither_line, to_gray_line};
 use crate::dump::{JobDump, JobManifest, PgmAccumulator, dumps_enabled};
 use crate::mock;
 use crate::printer_device::KsDevice;
-
-/// Maximum device print density; darkness (0-100%) scales onto 0..=MAX_DENSITY.
-const MAX_DENSITY: i32 = 15;
 
 /// Poll cadence and budget while waiting for print completion
 /// (COMPLETION_POLLS × COMPLETION_POLL_INTERVAL = 30s).
@@ -36,9 +32,9 @@ fn now_iso() -> String {
 /// Single source of truth, shared by the terminal job-failure path
 /// ([`failure_from_status`]), live status polling ([`KsDevice::status`]), and
 /// the mock simulator. Returns the raw reason bits with no fallback — callers
-/// decide how an empty set is treated (failure path forces `OTHER`, live
-/// polling leaves it empty = nothing wrong).
-pub(crate) fn reasons_from_status(s: &PrinterStatus) -> PrinterReason {
+/// decide how an empty set is treated (live polling leaves it empty = nothing
+/// wrong).
+pub(crate) fn reasons_from_status(s: &PrinterStatus, profile: PrintProfile) -> PrinterReason {
     let mut reasons = PrinterReason::empty();
     if s.cover_open {
         reasons |= PrinterReason::COVER_OPEN;
@@ -49,7 +45,9 @@ pub(crate) fn reasons_from_status(s: &PrinterStatus) -> PrinterReason {
     if s.label_rw_error || s.label_mode_error || s.ribbon_rw_error {
         reasons |= PrinterReason::MEDIA_JAM;
     }
-    if s.ribbon_end {
+    // The E10pro asserts ribbon_end during prints the vendor app completes,
+    // so surfacing it there would hold every job forever.
+    if s.ribbon_end && profile.params().ribbon_end_is_fatal {
         reasons |= PrinterReason::MEDIA_NEEDED;
     }
     if s.head_temp_high {
@@ -58,13 +56,24 @@ pub(crate) fn reasons_from_status(s: &PrinterStatus) -> PrinterReason {
     reasons
 }
 
-pub fn failure_from_status(s: &PrinterStatus, context: &str) -> JobFailure {
-    let mut reasons = reasons_from_status(s);
-    if reasons.is_empty() {
-        reasons = PrinterReason::OTHER;
-    }
-    let desc = s.error_description().unwrap_or_else(|| "unknown".into());
-    JobFailure::new(reasons, format!("{context}: {desc}"))
+/// Build a terminal [`JobFailure`] from a status, or `None` when `profile`
+/// sees nothing wrong with it.
+///
+/// The description covers only the bits this profile would actually abort on:
+/// an E-series job that fails for an unrelated reason must not blame the
+/// permanently-asserted `ribbon_end` bit the same profile deliberately
+/// ignores. `reasons_from_status` gates on the same bit, so an empty reason
+/// set and an absent description always agree.
+pub fn failure_from_status(
+    s: &PrinterStatus,
+    context: &str,
+    profile: PrintProfile,
+) -> Option<JobFailure> {
+    let desc = s.error_description(profile)?;
+    Some(JobFailure::new(
+        reasons_from_status(s, profile),
+        format!("{context}: {desc}"),
+    ))
 }
 
 fn failure_from_proto(e: ProtoError, context: &str) -> JobFailure {
@@ -83,38 +92,39 @@ pub struct KsJob {
     pub lines_received: u32,
     pub density: u8,
     pub printhead_width_dots: u32,
+    /// Wire-protocol variant for the target model.
+    pub profile: PrintProfile,
     pub pgm_acc: Option<PgmAccumulator>,
 }
 
 impl KsJob {
     /// Allocate the page buffer for an incoming raster.
     ///
-    /// The buffer is always tightly packed 1 bpp at `ceil(w/8)`, whatever the
-    /// source says: contone lines are dithered before `append_line`, and
+    /// The buffer is always tightly packed 1 bpp at `ceil(w/8)`, whatever
+    /// `options` says: contone lines are dithered before `append_line`, and
     /// [`raster_to_column_major`] re-reads the buffer at that same hard-coded
-    /// stride. Sizing from `src_bytes_per_line` instead copies raw RGB into
-    /// the bitmap (white `0xFF` becomes eight set dots — a black label), or,
-    /// for a padded 1 bpp source, shears every row. `append_line` truncates
-    /// the padding away as each line arrives.
+    /// stride. Sizing from `options.bytes_per_line` instead copies raw RGB
+    /// into the bitmap (white `0xFF` becomes eight set dots — a black label),
+    /// or, for a padded 1 bpp source, shears every row. `append_line`
+    /// truncates the padding away as each line arrives.
     pub fn start(
         _dev: &KsDevice,
-        w: u32,
-        h: u32,
-        src_bits_per_pixel: u32,
-        src_bytes_per_line: u32,
+        options: &JobOptions,
         density: u8,
         printhead_width_dots: u32,
+        profile: PrintProfile,
     ) -> Result<Self, JobFailure> {
+        let (w, h, bpp) = (options.width, options.height, options.bits_per_pixel);
         let bpl = w.div_ceil(8);
-        if src_bits_per_pixel == 1 && src_bytes_per_line > bpl {
+        if bpp == 1 && options.bytes_per_line > bpl {
             log::debug!(
-                "KsJob::start: source rows are padded to {src_bytes_per_line} bytes, \
-                 packing to {bpl}"
+                "KsJob::start: source rows are padded to {} bytes, packing to {bpl}",
+                options.bytes_per_line
             );
         }
         log::info!(
-            "KsJob::start: {w}x{h}, {src_bits_per_pixel}bpp in, bpl={bpl}, \
-             density={density}, printhead={printhead_width_dots}"
+            "KsJob::start: {w}x{h}, {bpp}bpp in, bpl={bpl}, \
+             density={density}, printhead={printhead_width_dots}, profile={profile:?}"
         );
         Ok(KsJob {
             width: w,
@@ -123,6 +133,7 @@ impl KsJob {
             raster_data: vec![0u8; (h * bpl) as usize],
             lines_received: 0,
             density,
+            profile,
             printhead_width_dots,
             pgm_acc: None,
         })
@@ -169,37 +180,29 @@ impl KsJob {
             center_in_printhead(&col_data, num_cols, self.width, self.printhead_width_dots);
         dump.printhead_pbm(&canvas, num_cols, canvas_bpl, self.printhead_width_dots);
 
+        let margin = self.profile.params().margin_dots;
         let buffers = split_into_buffers(
             &canvas,
             canvas_bpl as u8,
             num_cols as u16,
-            DEFAULT_MARGIN_DOTS,
-            DEFAULT_MARGIN_DOTS,
+            margin,
+            margin,
             self.density,
+            self.profile,
         );
-
-        let (compressed, avg) = compress_buffers(&buffers)
-            .map_err(|e| JobFailure::other(format!("compression: {e}")))?;
-        let speed = calc_speed(avg);
 
         let outcome: Result<(), JobFailure> = if let Some(ref printer) = dev.printer {
             dev.printing.store(true, Ordering::Release);
-            let result = printer.print_compressed(&compressed, speed).await;
+            let result = printer.print_page(&buffers).await;
             dev.printing.store(false, Ordering::Release);
             match result {
                 Ok(()) => Ok(()),
-                Err(ProtoError::InvalidResponse(msg)) => {
-                    if let Ok(Some(s)) = printer.query_status().await {
-                        if s.has_error() {
-                            Err(failure_from_status(&s, "print_compressed"))
-                        } else {
-                            Err(JobFailure::other(msg))
-                        }
-                    } else {
-                        Err(JobFailure::other(msg))
-                    }
-                }
-                Err(e) => Err(failure_from_proto(e, "print_compressed")),
+                Err(ProtoError::InvalidResponse(msg)) => Err(match printer.query_status().await {
+                    Ok(Some(s)) => failure_from_status(&s, "print_page", self.profile)
+                        .unwrap_or_else(|| JobFailure::other(msg)),
+                    _ => JobFailure::other(msg),
+                }),
+                Err(e) => Err(failure_from_proto(e, "print_page")),
             }
         } else {
             // Mock device: simulate the print delay, then check the simulator
@@ -280,20 +283,18 @@ impl RasterDriver for KsJob {
         let w = options.width;
         let h = options.height;
 
+        // The device knows its own wire protocol; it was resolved from the
+        // driver family when the transport was opened.
+        let profile = dev.profile();
+
         let darkness = printer.darkness();
-        // darkness is 0-100%; scale to 0-MAX_DENSITY, rounding to nearest.
-        let density = ((darkness * MAX_DENSITY + 50) / 100) as u8;
+        // darkness is 0-100%; scale onto the model's density range, rounding
+        // to nearest. The E-series accepts a wider range than the T50's 0-15.
+        let max_density = profile.params().max_density as i32;
+        let density = ((darkness * max_density + 50) / 100) as u8;
         let printhead_width_dots = printer.printhead_width_dots();
 
-        let mut ks = KsJob::start(
-            dev,
-            w,
-            h,
-            options.bits_per_pixel,
-            options.bytes_per_line,
-            density,
-            printhead_width_dots,
-        )?;
+        let mut ks = KsJob::start(dev, options, density, printhead_width_dots, profile)?;
         if options.bits_per_pixel > 1 && dumps_enabled() {
             ks.pgm_acc = Some(PgmAccumulator::new(w, h));
         }
@@ -368,7 +369,9 @@ mod tests {
         let packed = w.div_ceil(8); // 13
         let padded = 16; // what CUPS handed us
 
-        let mut ks = KsJob::start(&dev, w, h, 1, padded, 0, 128).unwrap();
+        let options = JobOptions::from_cups_v1(w, h, 1, padded, 1);
+        let mut ks =
+            KsJob::start(&dev, &options, 0, 128, PrintProfile::TSeries).unwrap();
         assert_eq!(ks.bytes_per_line, packed);
         assert_eq!(ks.raster_data.len(), (h * packed) as usize);
 
@@ -394,7 +397,8 @@ mod tests {
     #[test]
     fn start_sizes_contone_pages_from_the_dithered_width() {
         let dev = KsDevice::open_mock();
-        let ks = KsJob::start(&dev, 100, 4, 24, 300, 0, 128).unwrap();
+        let options = JobOptions::from_cups_v1(100, 4, 24, 300, 1);
+        let ks = KsJob::start(&dev, &options, 0, 128, PrintProfile::TSeries).unwrap();
         assert_eq!(ks.bytes_per_line, 13);
     }
 }

@@ -1,6 +1,7 @@
 use crate::cmd::{
     CMD_INQUIRY_STA, CMD_RD_DEV_NAME, CMD_READ_FWVER, CMD_READ_REV, CMD_RETURN_MAT, MAGIC1, MAGIC2,
 };
+use crate::profile::PrintProfile;
 
 /// Length of the BT response framing that precedes every payload. Parsers slice
 /// the payload from `data[BT_RESP_HEADER_LEN..]`.
@@ -38,28 +39,37 @@ impl PrinterStatus {
     /// Error flags paired with their human-readable descriptions, in report
     /// order. Single source for [`has_error`](Self::has_error) and
     /// [`error_description`](Self::error_description).
-    fn error_flags(&self) -> [(bool, &'static str); 8] {
+    ///
+    /// `ribbon_end` is profile-dependent: the E10pro asserts it (MSTA-low
+    /// `0x20`) throughout prints the vendor app completes successfully, so
+    /// there it is informational and must not appear here — see
+    /// [`PrintProfile::ribbon_end_is_fatal`].
+    fn error_flags(&self, profile: PrintProfile) -> [(bool, &'static str); 8] {
         [
             (self.label_rw_error, "label read/write error"),
             (self.label_end, "label roll end"),
             (self.label_mode_error, "label mode mismatch"),
             (self.ribbon_rw_error, "ribbon read/write error"),
-            (self.ribbon_end, "ribbon end"),
+            (
+                self.ribbon_end && profile.params().ribbon_end_is_fatal,
+                "ribbon end",
+            ),
             (self.cover_open, "cover open"),
             (self.head_temp_high, "printhead temperature too high"),
             (self.label_not_installed, "label not installed"),
         ]
     }
 
-    /// Check if any error flag is set.
-    pub fn has_error(&self) -> bool {
-        self.error_flags().iter().any(|(set, _)| *set)
+    /// Whether any error flag `profile` would abort a job on is set.
+    pub fn has_error(&self, profile: PrintProfile) -> bool {
+        self.error_flags(profile).iter().any(|(set, _)| *set)
     }
 
-    /// Return a human-readable description of any errors.
-    pub fn error_description(&self) -> Option<String> {
+    /// Human-readable description of the errors [`has_error`](Self::has_error)
+    /// reports, or `None` when there are none.
+    pub fn error_description(&self, profile: PrintProfile) -> Option<String> {
         let errors: Vec<&str> = self
-            .error_flags()
+            .error_flags(profile)
             .into_iter()
             .filter_map(|(set, msg)| set.then_some(msg))
             .collect();
@@ -279,7 +289,7 @@ mod tests {
         assert!(!status.buf_full);
         assert!(!status.device_busy);
         assert!(status.printing);
-        assert!(!status.has_error());
+        assert!(!status.has_error(PrintProfile::default()));
     }
 
     #[test]
@@ -289,8 +299,34 @@ mod tests {
         assert!(status.label_rw_error);
         assert!(status.cover_open);
         assert!(status.label_not_installed);
-        assert!(status.has_error());
+        assert!(status.has_error(PrintProfile::default()));
         assert_eq!(status.print_count, 5);
+    }
+
+    /// The E10pro raises `ribbon_end` throughout a print the vendor app
+    /// completes, so on that profile it must neither abort the job nor appear
+    /// in the failure message — while a real fault alongside it still does.
+    #[test]
+    fn ribbon_end_alone_does_not_block_the_e_series() {
+        let mut status = PrinterStatus {
+            ribbon_end: true,
+            ..Default::default()
+        };
+        assert!(status.has_error(PrintProfile::TSeries), "fatal on a T50");
+        assert!(!status.has_error(PrintProfile::ESeries));
+        assert_eq!(status.error_description(PrintProfile::ESeries), None);
+
+        status.cover_open = true;
+        assert!(status.has_error(PrintProfile::ESeries));
+        assert_eq!(
+            status.error_description(PrintProfile::ESeries).unwrap(),
+            "cover open",
+            "the ignored bit must not pad the message"
+        );
+        assert_eq!(
+            status.error_description(PrintProfile::TSeries).unwrap(),
+            "ribbon end, cover open"
+        );
     }
 
     #[test]

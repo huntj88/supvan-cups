@@ -20,9 +20,18 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ipp_printer_app::{JobFailure, PrinterReason};
+use supvan_proto::profile::PrintProfile;
 use supvan_proto::status::PrinterStatus;
 
 use crate::job::{failure_from_status, reasons_from_status};
+
+/// The simulator is process-global and has no device behind it, so it has no
+/// profile of its own: every status string it is fed is decoded on the T-series
+/// flow. The E-series' `ribbon_end` suppression therefore cannot be exercised
+/// through the mock — `SUPVAN_MOCK_STATUS=ribbon_end` reports `media-needed`
+/// even for a queue bound to `supvan_e`. Thread the queue's profile in here if
+/// that case ever needs simulating.
+const MOCK_PROFILE: PrintProfile = PrintProfile::TSeries;
 
 #[derive(Clone)]
 struct ParsedStatus {
@@ -130,7 +139,13 @@ impl MockController {
         if self.fail_repeat {
             *g = self.fail_template.clone();
         }
-        Some(failure_from_status(&parsed.status, "mock"))
+        // A status string that names no error bit still has to fail the job —
+        // it was queued explicitly by `SUPVAN_MOCK_FAIL`.
+        Some(
+            failure_from_status(&parsed.status, "mock", MOCK_PROFILE).unwrap_or_else(|| {
+                JobFailure::new(PrinterReason::OTHER, "mock: unknown".to_string())
+            }),
+        )
     }
 
     /// Sticky `printer-state-reasons`, surfaced by `KsDevice::status`.
@@ -165,7 +180,7 @@ fn parse_status(s: &str) -> ParsedStatus {
         }
     }
     ParsedStatus {
-        reasons: reasons_from_status(&status) | extra,
+        reasons: reasons_from_status(&status, MOCK_PROFILE) | extra,
         status,
     }
 }

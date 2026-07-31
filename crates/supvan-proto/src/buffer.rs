@@ -1,7 +1,12 @@
+use crate::profile::PrintProfile;
+
 /// Max image data bytes per print buffer (from Android R2.drawable.sf5334_).
+/// Applies to [`PrintProfile::TSeries`]; other profiles derive their own limit
+/// from [`ProfileParams::max_buf_data`](crate::profile::ProfileParams::max_buf_data).
 pub const MAX_BUF_DATA: usize = 4074;
 
-/// Print buffer size.
+/// Print buffer size for [`PrintProfile::TSeries`]. Model-specific sizes come
+/// from [`ProfileParams::buf_size`](crate::profile::ProfileParams::buf_size).
 pub const PRINT_BUF_SIZE: usize = 4096;
 
 /// Header size in print buffer.
@@ -9,9 +14,6 @@ pub const PRINT_BUF_HEADER: usize = 14;
 
 /// Margin clamp range (dots) for the print-buffer header.
 const MARGIN_MAX_DOTS: u16 = 900;
-
-/// Maximum density / red-deepness value encoded in the buffer header.
-const MAX_DENSITY: u8 = 15;
 
 /// The firmware re-reads the running checksum at every Nth byte; the builder
 /// folds in the byte just before each boundary.
@@ -79,9 +81,11 @@ pub struct PrintBufferParams<'a> {
     pub margin_top: u16,
     pub margin_bottom: u16,
     pub density: u8,
+    /// Model-specific constants (buffer size, `mat`/`nodu`, density cap).
+    pub profile: PrintProfile,
 }
 
-/// Build a 4096-byte print buffer.
+/// Build one print buffer, sized by [`ProfileParams::buf_size`](crate::profile::ProfileParams::buf_size).
 ///
 /// Layout:
 ///   [0..1]   Checksum (LE)
@@ -91,19 +95,25 @@ pub struct PrintBufferParams<'a> {
 ///   [7]      Reserved (0)
 ///   [8..9]   Margin top (LE, 1-900 dots)
 ///   [10..11] Margin bottom (LE, 1-900 dots)
-///   [12]     Density / red deepness (0-15)
+///   [12]     Density / red deepness (capped per profile)
 ///   [13]     0
 ///   [14..]   Image data
-pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
-    let mut buf = [0u8; PRINT_BUF_SIZE];
+pub fn build_print_buffer(p: &PrintBufferParams) -> Vec<u8> {
+    let params = p.profile.params();
+    let buf_size = params.buf_size;
+    let mut buf = vec![0u8; buf_size];
+
+    // Capped once up here: `nodu` mirrors the density on models that don't
+    // pin it, so a header must not carry a clamped [12] beside a raw `nodu`.
+    let density = p.density.min(params.max_density);
 
     // PAGE_REG_BITS
     let page_bits = build_page_reg_bits(&PageRegBits {
         page_st: p.page_st,
         page_end: p.page_end,
         prt_end: p.prt_end,
-        nodu: p.density,
-        mat: 1,
+        nodu: params.nodu.unwrap_or(density),
+        mat: params.mat,
         ..Default::default()
     });
     buf[2] = page_bits[0];
@@ -122,10 +132,12 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
     buf[10..12].copy_from_slice(&mb.to_le_bytes());
 
     // Density
-    buf[12] = p.density.min(MAX_DENSITY);
+    buf[12] = density;
 
-    // Image data at offset 14
-    let data_len = p.image_data.len().min(PRINT_BUF_SIZE - PRINT_BUF_HEADER);
+    // Image data at offset 14, bounded by the profile's declared data area
+    // (eight bytes under what fits on the T series) rather than by what fits,
+    // so bypassing `split_into_buffers` can't emit an invalid buffer.
+    let data_len = p.image_data.len().min(params.max_buf_data);
     buf[PRINT_BUF_HEADER..PRINT_BUF_HEADER + data_len].copy_from_slice(&p.image_data[..data_len]);
 
     // Checksum: sum(buf[2..14]) + sum of bytes at each 256-byte boundary
@@ -143,9 +155,18 @@ pub fn build_print_buffer(p: &PrintBufferParams) -> [u8; PRINT_BUF_SIZE] {
     buf
 }
 
-/// Split column-major image data into multiple print buffers.
+/// Columns of image data that fit in one print buffer.
 ///
-/// Returns a Vec of 4096-byte print buffers ready for LZMA compression.
+/// Shared with [`crate::bitmap::create_test_pattern`], whose whole purpose is
+/// drawing where the buffer boundaries land — it has to split identically.
+pub fn max_cols_per_buffer(per_line_byte: u8, profile: PrintProfile) -> u16 {
+    (profile.params().max_buf_data / per_line_byte as usize) as u16
+}
+
+/// Split column-major image data into print buffers ready for compression.
+///
+/// Buffer size and header constants come from `profile`; the number of columns
+/// per buffer falls out of how many fit in the model's buffer.
 pub fn split_into_buffers(
     image_data: &[u8],
     per_line_byte: u8,
@@ -153,8 +174,9 @@ pub fn split_into_buffers(
     margin_top: u16,
     margin_bottom: u16,
     density: u8,
-) -> Vec<[u8; PRINT_BUF_SIZE]> {
-    let max_cols = (MAX_BUF_DATA / per_line_byte as usize) as u16;
+    profile: PrintProfile,
+) -> Vec<Vec<u8>> {
+    let max_cols = max_cols_per_buffer(per_line_byte, profile);
     let image_cols = total_cols - margin_top - margin_bottom;
     let mut buffers = Vec::new();
     let mut cols_remaining = image_cols;
@@ -178,7 +200,13 @@ pub fn split_into_buffers(
             prt_end: is_last,
             margin_top,
             margin_bottom,
-            density,
+            // The E-series carries density only on the leading buffer.
+            density: if is_first || !profile.params().density_on_first_buffer_only {
+                density
+            } else {
+                0
+            },
+            profile,
         });
         buffers.push(buf);
         current_col += cols_in_buf;
@@ -233,8 +261,10 @@ mod tests {
             margin_top: 8,
             margin_bottom: 8,
             density: 4,
+            profile: PrintProfile::TSeries,
         });
         // Verify buffer structure
+        assert_eq!(buf.len(), PRINT_BUF_SIZE);
         assert_eq!(buf[6], 48); // bytes per line
         assert_eq!(buf[4], 84); // cols low
         assert_eq!(buf[5], 0); // cols high
@@ -253,7 +283,129 @@ mod tests {
         let per_line_byte = 48u8;
         let total_cols = 240u16;
         let image_data = vec![0u8; total_cols as usize * per_line_byte as usize];
-        let bufs = split_into_buffers(&image_data, per_line_byte, total_cols, 8, 8, 4);
+        let bufs = split_into_buffers(
+            &image_data,
+            per_line_byte,
+            total_cols,
+            8,
+            8,
+            4,
+            PrintProfile::TSeries,
+        );
         assert_eq!(bufs.len(), 3);
+    }
+
+    /// Reproduce the exact split an E10pro received from the vendor Android
+    /// app: a 373-column page at 12 bytes/line became two buffers of 332 and
+    /// 41 columns, headers `02 10 4c 01 0c 00 01 00 01 00 13 00` and
+    /// `04 10 29 00 0c 00 01 00 01 00 00 00`.
+    #[test]
+    fn e10_split_matches_captured_vendor_page() {
+        const COLS: u16 = 373;
+        const PER_LINE: u8 = 12;
+        let margin = PrintProfile::ESeries.params().margin_dots;
+        let total = COLS + margin * 2;
+        let image = vec![0u8; total as usize * PER_LINE as usize];
+
+        let bufs = split_into_buffers(
+            &image,
+            PER_LINE,
+            total,
+            margin,
+            margin,
+            19,
+            PrintProfile::ESeries,
+        );
+
+        assert_eq!(bufs.len(), 2);
+        for b in &bufs {
+            assert_eq!(b.len(), 4000, "E10 buffers are 4000 bytes, not 4096");
+            assert_eq!(b[6], PER_LINE);
+            assert_eq!(u16::from_le_bytes([b[8], b[9]]), 1, "margin_top");
+            assert_eq!(u16::from_le_bytes([b[10], b[11]]), 1, "margin_bottom");
+            // nodu is pinned at 4 and mat at 0, independent of density.
+            assert_eq!(b[3], 0x10, "page_reg high byte: nodu=4, mat=0");
+        }
+
+        // First buffer: page_st only, carries the density.
+        assert_eq!(u16::from_le_bytes([bufs[0][4], bufs[0][5]]), 332);
+        assert_eq!(bufs[0][2], 0x02);
+        assert_eq!(bufs[0][12], 19);
+
+        // Last buffer: page_end + prt_end, density zeroed.
+        assert_eq!(u16::from_le_bytes([bufs[1][4], bufs[1][5]]), 41);
+        assert_eq!(bufs[1][2], 0x04 | 0x08);
+        assert_eq!(bufs[1][12], 0);
+    }
+
+    /// Density 19 exceeds the T-series cap of 15 and must survive on E10.
+    #[test]
+    fn e10_density_is_not_clamped_to_the_t_series_maximum() {
+        let params = |profile| PrintBufferParams {
+            image_data: &[],
+            per_line_byte: 12,
+            cols_in_buf: 1,
+            page_st: true,
+            page_end: true,
+            prt_end: true,
+            margin_top: 1,
+            margin_bottom: 1,
+            density: 19,
+            profile,
+        };
+        assert_eq!(build_print_buffer(&params(PrintProfile::ESeries))[12], 19);
+        assert_eq!(build_print_buffer(&params(PrintProfile::TSeries))[12], 15);
+    }
+
+    /// `nodu` mirrors the density on the T series, so a header with a clamped
+    /// `[12]` beside a raw `nodu` would describe two different densities.
+    #[test]
+    fn nodu_mirrors_the_capped_density_not_the_raw_one() {
+        let buf = build_print_buffer(&PrintBufferParams {
+            image_data: &[],
+            per_line_byte: 12,
+            cols_in_buf: 1,
+            page_st: true,
+            page_end: false,
+            prt_end: false,
+            margin_top: 1,
+            margin_bottom: 1,
+            density: 19,
+            profile: PrintProfile::TSeries,
+        });
+        assert_eq!(buf[12], 15, "density byte is capped");
+        // page_reg high byte packs nodu at bits 2..6.
+        assert_eq!((buf[3] >> 2) & 0x0F, 15, "nodu tracks the capped density");
+    }
+
+    /// A buffer carries what the profile *declares*, which on the T series is
+    /// eight bytes under what would otherwise fit.
+    #[test]
+    fn image_data_is_bounded_by_the_profiles_declared_data_area() {
+        for profile in [PrintProfile::TSeries, PrintProfile::ESeries] {
+            let params = profile.params();
+            // The header plus the declared data area must fit the buffer, or
+            // the copy below would be writing out of bounds.
+            assert!(
+                PRINT_BUF_HEADER + params.max_buf_data <= params.buf_size,
+                "{profile:?}: header + data area overruns the buffer"
+            );
+            let oversized = vec![0xAAu8; params.buf_size];
+            let buf = build_print_buffer(&PrintBufferParams {
+                image_data: &oversized,
+                per_line_byte: 12,
+                cols_in_buf: 1,
+                page_st: true,
+                page_end: false,
+                prt_end: false,
+                margin_top: 1,
+                margin_bottom: 1,
+                density: 1,
+                profile,
+            });
+            assert_eq!(buf.len(), params.buf_size);
+            let copied = buf[PRINT_BUF_HEADER..].iter().filter(|&&b| b == 0xAA).count();
+            assert_eq!(copied, params.max_buf_data, "{profile:?}: wrong data length");
+        }
     }
 }

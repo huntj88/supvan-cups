@@ -1,19 +1,23 @@
 //! Application entry: IPP server, discovery, state.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ipp_printer_app::{
-    DeviceBackend, DiscoveredDevice, JobContext, JobFailure, JobOutcome, PollStatus, PrinterConfig,
-    PrinterReason, PrinterRegistry, ReadyMedia, Server, ServerOptions, default_state_path,
+    DeviceBackend, DiscoveredDevice, JobContext, JobFailure, JobOutcome, PersistedState,
+    PollStatus, PrinterConfig, PrinterReason, PrinterRegistry, ReadyMedia, Server, ServerOptions,
+    default_state_path,
 };
+use futures::stream::StreamExt;
 use parking_lot::RwLock;
+use supvan_proto::profile::PrintProfile;
 
 use crate::ble_discover::BleCandidate;
 use crate::discover::BtCandidate;
-use crate::ipp_job::{config_from_family, run_cups_raster_job};
+use crate::ipp_job::{JobTarget, config_from_family, run_cups_raster_job};
 use crate::models;
 use crate::usb_discover::UsbCandidate;
+use crate::util::slug;
 
 /// Threshold below which the printer-state-reasons gets the MEDIA_LOW flag.
 /// Conservative — most label-printer ops want a few minutes of warning.
@@ -34,30 +38,114 @@ fn roll_cache() -> &'static Mutex<HashMap<String, RollFingerprint>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub struct SupvanDeviceBackend;
+/// The device URI [`SupvanDeviceBackend::list`](SupvanDeviceBackend) emits for a printer whose
+/// firmware self-id is `name`. Also what the framework persists and matches an
+/// already-configured printer on, so it is the join key between a live
+/// candidate and the saved registry.
+fn device_uri_for(name: &str) -> String {
+    format!("supvan://{}", slug(name))
+}
 
-/// Slugify a printer-reported name into something CUPS can use as a queue
-/// name. Lowercase ASCII alphanumerics; everything else becomes a hyphen.
-fn slug(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
+pub struct SupvanDeviceBackend {
+    /// Device URIs already in the persisted registry, snapshotted at startup.
+    ///
+    /// Only used to decide which candidates are worth an `RD_DEV_NAME` probe.
+    /// `Server::bootstrap_printers` loads the saved printers *before* calling
+    /// [`DeviceBackend::list`] and then drops any discovered device whose URI
+    /// it already holds, so for these the probe's answer is computed and
+    /// thrown away — it feeds `MDL:`, which feeds `driver_for_device`, which
+    /// only runs for devices that are new.
+    known_uris: HashSet<String>,
+}
+
+impl SupvanDeviceBackend {
+    /// Read the persisted registry to seed [`Self::known_uris`]. A missing or
+    /// unreadable state file yields an empty set, which only means the first
+    /// run probes every candidate — the correct behaviour, since nothing is
+    /// yet known about any of them.
+    pub fn new(state_path: &std::path::Path) -> Self {
+        let known_uris: HashSet<String> = PersistedState::load(state_path)
+            .printers
+            .into_iter()
+            .map(|p| p.device_uri)
+            .collect();
+        log::debug!(
+            "discover: {} printer(s) already configured",
+            known_uris.len()
+        );
+        Self { known_uris }
+    }
+
+    /// Whether a BT candidate is worth spending an `RD_DEV_NAME` probe on.
+    ///
+    /// The probe is the only way to learn a BT-only printer's model — BlueZ
+    /// exposes just the firmware serial — and the model picks the driver
+    /// family, hence the wire protocol. But it costs an exclusive RFCOMM
+    /// connection, which locks out the vendor app and blocks for the kernel's
+    /// connect timeout on a printer that is switched off. So it is only spent
+    /// where it can still change the outcome:
+    ///
+    /// - An **already-configured** printer keeps the driver it was added with;
+    ///   `bootstrap_printers` discards this candidate wholesale.
+    /// - A name `bt_patterns` pins to the **T-series** flow has already
+    ///   decided its protocol, and no model name can move it.
+    ///
+    /// Everything else is probed: a name that pins nothing could be an
+    /// E-series unit with a hardware code the registry doesn't list, and a
+    /// name that pins the E-series still gets a sharper `MDL:` from its
+    /// marketing name.
+    fn needs_model_probe(&self, candidate: &BtCandidate) -> bool {
+        if self.known_uris.contains(&device_uri_for(&candidate.name)) {
+            log::debug!(
+                "discover: {} ({}) is already configured, skipping the RD_DEV_NAME probe",
+                candidate.name,
+                candidate.address
+            );
+            return false;
+        }
+        match models::family_from_bt_patterns(&candidate.name) {
+            Some(f) if f.print_profile == PrintProfile::TSeries => {
+                log::debug!(
+                    "discover: {} ({}) is pinned to the T-series flow by bt_patterns, \
+                     skipping the RD_DEV_NAME probe",
+                    candidate.name,
+                    candidate.address
+                );
+                false
             }
-        })
-        .collect();
-    let s: String = s
-        .split('-')
-        .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-    if s.is_empty() {
-        "printer".to_string()
-    } else {
-        s
+            _ => true,
+        }
+    }
+
+    /// Cap on in-flight probes: each may dial a fresh RFCOMM socket and hold
+    /// it for [`PROBE_TIMEOUT`] on the blocking pool.
+    const MAX_CONCURRENT_PROBES: usize = 4;
+
+    /// Fill in [`BtCandidate::model_name`] for the candidates that need it.
+    ///
+    /// Probes run concurrently — a house with several powered-off printers
+    /// would otherwise pay [`PROBE_TIMEOUT`] once per device — but no more
+    /// than [`Self::MAX_CONCURRENT_PROBES`] at a time. Order is preserved, so
+    /// results still line up with `candidates`.
+    async fn probe_bt_models(&self, candidates: &mut [BtCandidate]) {
+        // Decided up front so the futures below borrow nothing.
+        let wanted: Vec<Option<String>> = candidates
+            .iter()
+            .map(|c| self.needs_model_probe(c).then(|| c.address.clone()))
+            .collect();
+        let names: Vec<Option<String>> = futures::stream::iter(wanted)
+            .map(|addr| async move {
+                match addr {
+                    Some(a) => crate::device::probe_bt_model_name(&a).await,
+                    None => None,
+                }
+            })
+            .buffered(Self::MAX_CONCURRENT_PROBES)
+            .collect()
+            .await;
+        for (c, name) in candidates.iter_mut().zip(names) {
+            c.model_name = name;
+        }
     }
 }
 
@@ -81,8 +169,12 @@ impl DeviceBackend for SupvanDeviceBackend {
         // BT pulls the firmware-reported name from BlueZ; BLE scans for
         // E11/E12-class advertisers (no-op without the `ble` feature).
         let usb = crate::usb_discover::list_candidates().await;
-        let bt = crate::discover::list_candidates();
+        let mut bt = crate::discover::list_candidates();
         let ble = crate::ble_discover::list_candidates().await;
+
+        // Enumeration is probe-free; ask the wire for a model name only where
+        // it can still decide something.
+        self.probe_bt_models(&mut bt).await;
 
         // Group by printer-reported name. USB candidates carry their
         // `device_sn` (parsed from `RETURN_MAT` at offset 40); BT and BLE carry
@@ -93,7 +185,11 @@ impl DeviceBackend for SupvanDeviceBackend {
         // was busy and RETURN_MAT didn't reply), fall back to its bus URI
         // as the group key. A final 1-USB-only + 1-BT-only sweep merges
         // them under the BT name to keep single-printer households tidy.
-        type Group = (Option<UsbCandidate>, Option<BtCandidate>, Option<BleCandidate>);
+        type Group = (
+            Option<UsbCandidate>,
+            Option<BtCandidate>,
+            Option<BleCandidate>,
+        );
         let mut by_name: BTreeMap<String, Group> = BTreeMap::new();
         for u in usb {
             let key = u.printer_name.clone().unwrap_or_else(|| u.uri_id.clone());
@@ -133,11 +229,26 @@ impl DeviceBackend for SupvanDeviceBackend {
             let model = usb
                 .as_ref()
                 .map(|u| u.model_name.clone())
-                .or_else(|| bt.as_ref().map(|_| "T50 Series".to_string()))
+                // `MDL:` picks the driver family, and BT-only printers report
+                // their model on the wire.
+                .or_else(|| bt.as_ref().and_then(|b| b.model_name.clone()))
+                // No `RD_DEV_NAME` (probe skipped or the unit was busy): the
+                // advertised name still carries the hardware code
+                // `bt_patterns` routes on (`T0143…` is an E-series). Naming a
+                // family outright instead sends every unprobed T80/G/TP/E unit
+                // to the T-series flow, which prints the E-series blank.
+                .or_else(|| bt.as_ref().map(|_| name.clone()))
+                // BLE discovery only ever scans for the E-series, and
+                // `e-series` is a `bt_patterns` key that routes there.
                 .or_else(|| ble.as_ref().map(|_| "E-Series".to_string()))
                 .unwrap_or_else(|| "T50 Series".to_string());
-            let info = format!("Supvan {model} {name}");
-            let uri = format!("supvan://{}", slug(&name));
+            // The model stands in for itself when it *is* the advertised name.
+            let info = if model == name {
+                format!("Supvan {name}")
+            } else {
+                format!("Supvan {model} {name}")
+            };
+            let uri = device_uri_for(&name);
             let device_id = format!("MFG:Supvan;MDL:{model};CMD:SUPVAN;");
             log::info!(
                 "discover: emitting {uri} (usb={}, bt={}, ble={})",
@@ -162,7 +273,11 @@ impl DeviceBackend for SupvanDeviceBackend {
     }
 
     async fn poll_status(&self, config: &PrinterConfig) -> Option<PollStatus> {
-        let dev = crate::device::open_uri(&config.device_uri).await;
+        let dev = crate::device::open_uri(
+            &config.device_uri,
+            models::profile_for_driver(&config.driver_name),
+        )
+        .await;
         let Some(dev) = dev else {
             // Device unreachable (powered off / unplugged / BT down). Report
             // OFFLINE so the framework marks us printer-state=stopped and CUPS
@@ -174,6 +289,8 @@ impl DeviceBackend for SupvanDeviceBackend {
             });
         };
 
+        // Status decoding is model-specific (the E-series flags ribbon_end
+        // during normal prints), so resolve the family's profile first.
         let mut reasons = dev.status().await;
         let mut ready_media = None;
         let mut supply_percent = None;
@@ -252,7 +369,12 @@ impl DeviceBackend for SupvanDeviceBackend {
         // Map Identify-Printer to a physical beep via CHECK_DEVICE. Any action
         // keyword (display/sound/flash) triggers the same buzzer. Mock devices
         // no-op on identify.
-        if let Some(dev) = crate::device::open_uri(&config.device_uri).await {
+        if let Some(dev) = crate::device::open_uri(
+            &config.device_uri,
+            models::profile_for_driver(&config.driver_name),
+        )
+        .await
+        {
             log::info!("identify {} (actions={actions:?})", config.name);
             dev.identify().await;
         }
@@ -282,7 +404,7 @@ pub async fn run_server(host: &str, port: u16) -> std::io::Result<()> {
 
     let registry: PrinterRegistry = Arc::new(RwLock::new(Vec::new()));
     let state_path = default_state_path("supvan-printer-app");
-    let backend = Arc::new(SupvanDeviceBackend);
+    let backend = Arc::new(SupvanDeviceBackend::new(&state_path));
 
     Server::bootstrap_printers(&registry, backend.as_ref(), &state_path, config_from_family).await;
 
@@ -317,27 +439,10 @@ pub async fn run_server(host: &str, port: u16) -> std::io::Result<()> {
                         .first()
                         .copied()
                         .unwrap_or(DEFAULT_MEDIA_SIZE_HMM);
-                    crate::ipp_job::run_jpeg_job(
-                        &cfg.name,
-                        &cfg.device_uri,
-                        cfg.darkness,
-                        cfg.printhead_width_dots,
-                        media_size,
-                        &raster,
-                        copies,
-                    )
-                    .await
+                    crate::ipp_job::run_jpeg_job(JobTarget::from(&cfg), media_size, &raster, copies)
+                        .await
                 } else {
-                    run_cups_raster_job(
-                        &cfg.name,
-                        &cfg.device_uri,
-                        cfg.darkness,
-                        cfg.printhead_width_dots,
-                        &cfg.driver_name,
-                        &raster,
-                        copies,
-                    )
-                    .await
+                    run_cups_raster_job(JobTarget::from(&cfg), &raster, copies).await
                 };
                 match result {
                     Ok(()) => JobOutcome::Completed,
@@ -346,11 +451,9 @@ pub async fn run_server(host: &str, port: u16) -> std::io::Result<()> {
                     // the framework retry until it's resolved, not drop it (the way
                     // a real printer holds a job through a jam). Anything else is a
                     // permanent failure for this document.
-                    Err(f) if f.printer_reasons.is_recoverable() => {
-                        JobOutcome::DeviceUnavailable {
-                            reasons: f.printer_reasons,
-                        }
-                    }
+                    Err(f) if f.printer_reasons.is_recoverable() => JobOutcome::DeviceUnavailable {
+                        reasons: f.printer_reasons,
+                    },
                     Err(f) => JobOutcome::Failed(f),
                 }
             })
@@ -392,4 +495,118 @@ fn prune_stale_supvan(registry: &PrinterRegistry) {
         }
         keep
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::tests::load_once;
+
+    fn backend(known: &[&str]) -> SupvanDeviceBackend {
+        SupvanDeviceBackend {
+            known_uris: known.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn candidate(name: &str) -> BtCandidate {
+        BtCandidate {
+            address: "A4:93:40:5D:71:B6".to_string(),
+            name: name.to_string(),
+            model_name: None,
+        }
+    }
+
+    /// The probe is skipped wherever `bt_patterns` already pins the family, so
+    /// an unprobed candidate is the normal case — its `MDL:` still has to
+    /// route. Naming a family outright collapses them all onto the T-series.
+    #[test]
+    fn an_unprobed_bt_name_still_routes_to_its_own_family() {
+        load_once();
+        for (name, expect) in [
+            ("T0143F2408183024", "supvan_e"),
+            ("E10pro", "supvan_e"),
+            ("T80", "supvan_t80"),
+            ("G15Mini", "supvan_g"),
+            ("TP76", "supvan_tp76"),
+            ("T0117A2410211517", "supvan_t50"),
+        ] {
+            let family = models::family_for_model_hint(name);
+            assert_eq!(
+                family.driver_name.to_string_lossy(),
+                expect,
+                "{name} routed to the wrong family"
+            );
+        }
+        // What the old fallback substituted for every one of them.
+        assert_eq!(
+            models::family_for_model_hint("T50 Series")
+                .driver_name
+                .to_string_lossy(),
+            "supvan_t50"
+        );
+    }
+
+    /// An RFCOMM socket is exclusive on these printers, so the probe is only
+    /// worth spending where it can still change the driver decision.
+    #[test]
+    fn model_probe_is_skipped_for_names_already_pinned_to_the_t_series() {
+        load_once();
+        let b = backend(&[]);
+        // Hardware codes and marketing names that `bt_patterns` resolves to a
+        // T-series family: RD_DEV_NAME cannot change the answer.
+        for name in ["T0117A2410211517", "T50M Pro", "T80", "G15Mini", "TP76"] {
+            assert!(
+                !b.needs_model_probe(&candidate(name)),
+                "{name} is already pinned to the T-series flow"
+            );
+        }
+    }
+
+    #[test]
+    fn model_probe_still_runs_where_it_can_change_the_answer() {
+        load_once();
+        let b = backend(&[]);
+        // Pinned to the E-series: the marketing name still refines `MDL:`.
+        for name in ["T0143F2408183024", "E10pro", "E12"] {
+            assert!(
+                b.needs_model_probe(&candidate(name)),
+                "{name} is an E-series unit"
+            );
+        }
+        // Pins nothing — its hardware code isn't listed, so it could be an
+        // E-series unit the registry doesn't know about yet.
+        for name in ["T0199Z2501010001", "D42unknown", ""] {
+            assert!(
+                b.needs_model_probe(&candidate(name)),
+                "{name:?} pins no family, so its model is still unknown"
+            );
+        }
+    }
+
+    /// `bootstrap_printers` drops a discovered device whose URI it already
+    /// holds, so probing one is pure cost: an exclusive RFCOMM socket, and up
+    /// to the kernel's connect timeout if the unit has been switched off.
+    #[test]
+    fn model_probe_is_skipped_for_an_already_configured_printer() {
+        load_once();
+        // An E-series unit — probed when unknown, skipped once configured.
+        let c = candidate("T0143F2408183024");
+        assert!(backend(&[]).needs_model_probe(&c));
+        assert!(!backend(&[&device_uri_for(&c.name)]).needs_model_probe(&c));
+        // ... and the join key really is the emitted URI, slug and all.
+        assert_eq!(
+            device_uri_for("T0143F2408183024"),
+            "supvan://t0143f2408183024"
+        );
+        assert!(!backend(&["supvan://t0143f2408183024"]).needs_model_probe(&c));
+    }
+
+    /// A different printer being configured must not suppress this one's
+    /// probe, or the first E-series unit added would blind every later one.
+    #[test]
+    fn another_printers_uri_does_not_suppress_the_probe() {
+        load_once();
+        let c = candidate("T0143F2408183024");
+        assert!(backend(&["supvan://t0117a2410211517"]).needs_model_probe(&c));
+    }
 }

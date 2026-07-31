@@ -7,6 +7,71 @@ minor version).
 
 ## [Unreleased]
 
+### Added
+
+- **Support for the Bluetooth-only E-series (E10, E10pro, E11, E12, E16).**
+  These label makers do not speak the T50 print flow the driver was built
+  around — a job fed through it advances the tape and comes out blank. A new
+  `supvan_proto::profile::PrintProfile` carries the per-model wire constants
+  (4000-byte print buffers, 96-dot head, `mat=0`, constant `nodu=4`, density up
+  to 19 on the leading buffer only, `BUF_FULL(0, 0)`, one LZMA stream per
+  buffer, and the `0xC9`/`0xBA` commands that bracket `START_PRINT`). A family
+  selects it with `profile = "e-series"` in `data/models.toml`; every other
+  family keeps the T-series flow byte for byte.
+
+  Every value was recovered by decoding a Bluetooth HCI snoop of the vendor
+  Android app printing one 15 × 50 mm label. The full annotated specification,
+  with the captured evidence and what was verified *unchanged*, is in
+  `docs/E10-PROTOCOL.md`; `scripts/btsnoop_supvan.py` decodes such a capture.
+  Only the E10/E10pro is captured; E11/E12/E16 are the same BT-only class and
+  share the profile, because the alternative is the T50 flow that is known to
+  print them blank. The whole series is driven at the E10's 96-dot head:
+  under-declaring a wider head only narrows the printable band, while
+  over-declaring it prints nothing at all (`docs/E10-PROTOCOL.md` §11).
+
+- **BT model-name probe.** BlueZ only exposes a Supvan printer's firmware
+  serial (`T0143F2408183024`), never its model. Discovery now reads
+  `RD_DEV_NAME` over RFCOMM and uses the answer (`E10pro`) as the IEEE 1284
+  `MDL:` field — which is what selects the driver family, and hence the wire
+  protocol, for a BT-only printer.
+
+  The probe costs an exclusive RFCOMM connection, which locks out the vendor
+  app, and `libc::connect` on such a socket has no timeout of its own, so a
+  printer that has since been switched off would block for the kernel's whole
+  connect timeout. It is therefore bounded, run against all candidates
+  concurrently, dialled on the blocking pool rather than a runtime worker, and
+  spent only where it can still change the outcome — skipping any name
+  `bt_patterns` already pins to the T-series flow, and any printer already in
+  the persisted registry, whose discovered entry `bootstrap_printers` discards
+  wholesale. Deciding that is registry policy, so it lives in the device
+  backend; `discover::list_candidates` stays a probe-free BlueZ enumeration.
+
+### Changed
+
+- `Printer` owns its `PrintProfile`, set once when the transport is opened, so
+  the print state machine no longer takes it as a parameter at every step.
+  `Printer::print_compressed` is replaced by `Printer::print_page`, which takes
+  the built buffers and performs compression itself — the page is one LZMA
+  stream on the T-series flow and one per buffer on the E-series, which the
+  caller shouldn't have to know. Compression runs before `CHECK_DEVICE`, so no
+  LZMA pass ever falls between `START_PRINT` and the first data packet; the
+  printer is live from that point and times out waiting for data.
+
+- `PrinterStatus::has_error` / `error_description` now take a `PrintProfile`,
+  because what counts as an error is model-specific: the E10pro asserts
+  `ribbon_end` throughout prints the vendor app completes successfully, and
+  treating it as fatal held every job with `media-needed` forever.
+
+- `create_test_pattern` draws its per-buffer sub-patterns using the target
+  profile's buffer size and margins, so the boundaries it marks are the ones
+  `split_into_buffers` actually produces. It also takes the printhead width
+  rather than assuming the T50's 384 dots.
+
+- **`bt_patterns`: `e10`/`e11`/`e12`/`e16` now select `supvan_e`, not
+  `supvan_t50`.** Upgrading: an E-series queue configured against an older
+  release still names the `supvan_t50` driver and will keep printing blank.
+  Remove and re-add it so discovery re-resolves the family.
+
 ### Fixed
 
 - **24-bit sRGB rasters printed as a solid black label.** The IPP layer
@@ -41,6 +106,10 @@ minor version).
   buffer holds. The G series is 190 dots, where walking the nominal width ran
   off the end of the last column: silent corruption of the next column for
   every column but the last, and an out-of-bounds panic on it.
+
+- `supvan-cli` selects its wire protocol from `RD_DEV_NAME`, since it has no
+  driver registry to consult. A failed probe is non-fatal — `RD_DEV_NAME`
+  carries no name over USB HID — and falls back to the T-series flow.
 
 ## [0.5.1] - 2026-07-01
 

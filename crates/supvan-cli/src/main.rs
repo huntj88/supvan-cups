@@ -8,8 +8,9 @@ use std::error::Error;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use supvan_proto::bitmap::PRINTHEAD_WIDTH_MM;
+use supvan_proto::bitmap::DOTS_PER_MM;
 use supvan_proto::printer::Printer;
+use supvan_proto::profile::PrintProfile;
 use supvan_proto::status::{DEFAULT_LABEL_GAP_MM, DEFAULT_LABEL_HEIGHT_MM, MaterialInfo};
 
 type CliResult = Result<(), Box<dyn Error>>;
@@ -37,7 +38,8 @@ enum Command {
     TestPrint {
         /// Bluetooth address or /dev/hidrawN path
         target: String,
-        /// Print density (0-15)
+        /// Print density. Clamped to the detected model's maximum (0-15 on
+        /// the T50 family, 0-19 on the E-series).
         #[arg(short, long, default_value_t = 4)]
         density: u8,
     },
@@ -50,19 +52,40 @@ enum Command {
     Discover,
 }
 
-fn connect(target: &str) -> Result<Printer, Box<dyn Error>> {
+/// Open `target` and select the wire protocol from the firmware's own name.
+///
+/// The CLI has no driver registry — that lives in `supvan-printer-app`'s
+/// `data/models.toml` — so `RD_DEV_NAME` is the only thing it can ask, and it
+/// has to ask before any command interprets status or lays out a page.
+///
+/// A failed probe is not fatal: `RD_DEV_NAME` carries no name over USB HID
+/// (the 8-byte status frame can't hold a string), and a unit that doesn't
+/// answer it must not lose `probe`, `feed` and `material` as well. Falling
+/// back to the T-series flow is what every model did before the E-series.
+async fn connect(target: &str) -> Result<Printer, Box<dyn Error>> {
     if target.starts_with("/dev/hidraw") {
         eprintln!("Opening USB HID {target}...");
     } else {
         eprintln!("Connecting to {target} (Bluetooth)...");
     }
-    let printer = Printer::open_target(target)?;
+    let mut printer = Printer::open_target(target)?;
     eprintln!("Connected.");
+
+    let device_name = match printer.read_device_name().await {
+        Ok(n) => n.unwrap_or_default(),
+        Err(e) => {
+            eprintln!("Warning: RD_DEV_NAME failed ({e}); assuming the T-series flow.");
+            String::new()
+        }
+    };
+    let profile = PrintProfile::from_device_name(&device_name);
+    eprintln!("Device {device_name:?} -> profile {profile:?}");
+    printer.set_profile(profile);
     Ok(printer)
 }
 
 async fn cmd_probe(target: &str) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
 
     if printer.check_device().await? {
         eprintln!("Device: OK");
@@ -78,7 +101,7 @@ async fn cmd_probe(target: &str) -> CliResult {
         eprintln!("  low_battery:  {}", status.low_battery);
         eprintln!("  cover_open:   {}", status.cover_open);
         eprintln!("  print_count:  {}", status.print_count);
-        if let Some(errs) = status.error_description() {
+        if let Some(errs) = status.error_description(printer.profile()) {
             eprintln!("  ERRORS:       {errs}");
         }
     }
@@ -112,7 +135,7 @@ async fn cmd_probe(target: &str) -> CliResult {
 }
 
 async fn cmd_material(target: &str) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
 
     if !printer.check_device().await? {
         return Err("device not responding".into());
@@ -142,7 +165,8 @@ async fn cmd_material(target: &str) -> CliResult {
 }
 
 async fn cmd_test_print(target: &str, density: u8) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
+    let printhead_mm = printer.profile().params().default_printhead_dots / DOTS_PER_MM;
 
     // Query material to get label dimensions, falling back to printhead-width
     // defaults if no label is installed.
@@ -150,10 +174,10 @@ async fn cmd_test_print(target: &str, density: u8) -> CliResult {
         Some(m) => m,
         None => {
             eprintln!(
-                "No material info, using defaults ({PRINTHEAD_WIDTH_MM}mm x {DEFAULT_LABEL_HEIGHT_MM}mm)"
+                "No material info, using defaults ({printhead_mm}mm x {DEFAULT_LABEL_HEIGHT_MM}mm)"
             );
             MaterialInfo {
-                width_mm: PRINTHEAD_WIDTH_MM as u8,
+                width_mm: printhead_mm as u8,
                 height_mm: DEFAULT_LABEL_HEIGHT_MM,
                 gap_mm: DEFAULT_LABEL_GAP_MM,
                 ..Default::default()
@@ -171,7 +195,7 @@ async fn cmd_test_print(target: &str, density: u8) -> CliResult {
 }
 
 async fn cmd_feed(target: &str) -> CliResult {
-    let printer = connect(target)?;
+    let printer = connect(target).await?;
     printer.paper_skip().await?;
     eprintln!("Fed one label.");
     Ok(())

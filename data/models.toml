@@ -19,6 +19,27 @@ media_mm = [
 ]
 
 [[families]]
+name = "supvan_e"
+description = "Supvan E Series"
+dpi = 203
+# 96 dots = 12 mm of print on 15 mm tape. Recovered from an HCI capture of the
+# vendor Android app printing to an E10pro: its buffers carry
+# per_line_byte = 12. E11/E12/E16 are the same BT-only class and share this
+# print flow; their heads are unverified, but under-declaring one only narrows
+# the printable band, whereas over-declaring prints nothing at all. Split them
+# into their own family once a capture gives a real `per_line_byte`.
+# The E-series speaks a different print flow — see `profile` and
+# `supvan_proto::profile::PrintProfile`.
+printhead_dots = 96
+profile = "e-series"
+media_mm = [
+    [12, 20], [12, 30], [12, 40],
+    [15, 20], [15, 30], [15, 40], [15, 50],
+    [20, 20], [20, 30], [20, 40],
+    [25, 30], [25, 40], [25, 50],
+]
+
+[[families]]
 name = "supvan_t80"
 description = "Supvan T80 Series"
 dpi = 201
@@ -201,9 +222,18 @@ family = "supvan_sp650"
 # Used for BT discovery (is_matching_bt_name) and family detection
 # (family_for_model_hint). The brand names "supvan" and "katasymbol" are
 # always accepted for discovery but don't select a specific family.
+#
+# `t0117`/`t0143`-style entries are firmware *hardware codes* from the serial
+# name a printer broadcasts over BT (e.g. `T0143F2408183024` = E10).
 
 [bt_patterns]
-supvan_t50 = ["t50", "t0117", "e10", "e11", "e12", "e16"]
+supvan_t50 = ["t50", "t0117"]
+# The whole E-series is one BT-only class speaking one print flow. Only the
+# E10/E10pro is captured; E11/E12/E16 are routed here on the strength of that,
+# since the T50 flow prints them blank. `e-series` catches the placeholder
+# model name a BLE-only candidate gets when no RD_DEV_NAME probe is possible
+# (BLE discovery only ever scans for this class — see ble_discover).
+supvan_e = ["e10", "e11", "e12", "e16", "e-series", "t0143"]
 supvan_t80 = ["t80"]
 supvan_g = ["g11", "g15", "g18"]
 supvan_tp76 = ["tp76"]

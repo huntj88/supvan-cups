@@ -32,9 +32,19 @@ All USB models use VID `0x1820`; Bluetooth and USB are auto-discovered.
 | TP80 Series | TP80A, TP80A Pro | 305 | 80 mm / 960 dots |
 | TP86 Series | TP86A, TP86A Pro | 305 | 86 mm / 1032 dots |
 | SP650 | SP650 | 203 | 48 mm / 384 dots |
+| E Series | E10, E10pro, E11, E12, E16 | 203 | 12 mm / 96 dots |
 
-Bluetooth-only models (E10, E11, E12, E16) run on the T50 driver, as do
-Katasymbol-branded equivalents. The model registry lives in
+The **E-series** are Bluetooth-only label makers and speak a different print
+flow from the rest of the range — smaller print buffers, different `PAGE_REG`
+constants and one transfer per buffer (see
+[docs/E10-PROTOCOL.md](docs/E10-PROTOCOL.md)). The flow is verified against a
+capture of the vendor app driving an E10pro; E11, E12 and E16 are the same
+BT-only class and use it too, since the T50 flow prints them blank. Their
+printheads are unconfirmed, so the whole series is driven at the E10's 12 mm —
+a wider model prints correctly in a narrower band until someone captures one
+([docs/E10-PROTOCOL.md](docs/E10-PROTOCOL.md) §11).
+Katasymbol-branded equivalents behave as their Supvan counterparts.
+The model registry lives in
 [`data/models.toml`](data/models.toml) — it is compiled into the binary as a
 fallback and can be overridden at runtime with `SUPVAN_MODELS` (no recompile).
 

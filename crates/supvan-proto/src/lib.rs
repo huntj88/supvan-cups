@@ -20,6 +20,7 @@ pub mod data;
 pub mod error;
 pub mod hidraw;
 pub mod printer;
+pub mod profile;
 pub mod rfcomm;
 pub mod speed;
 pub mod spp_pipe;

@@ -356,3 +356,66 @@ over GATT notifications as over the RFCOMM stream.
   one method per command code, returning the parsed shape.
 - `crates/supvan-app/src/job.rs::transfer_page` — the real-world
   ordering of these commands for a one-page label print.
+
+## E-series print flow
+
+The BT-only E-series (E10/E10pro/E11/E12/E16, verified on an **E10pro**,
+protocol rev 1.4) does not speak the T50 print flow. The differences below were
+recovered by decoding a Bluetooth HCI snoop of the vendor Android app printing
+one 15x50 mm label, and are encoded in
+`supvan_proto::profile::PrintProfile::ESeries`.
+
+Identical to the T50 flow: command framing, the `AA BB` data packets, LZMA
+settings (props `0x5D` = lc3/lp0/pb2, dict 8192, definite size patched into the
+alone header), the print-buffer checksum, the `START_PRINT` parameter (0), the
+`NEXT_ZIPPEDBULK` block size (a literal 512, which SPP framing always carries
+regardless of model), and the column-major LSB-first bitmap layout.
+
+Everything else differs:
+
+| Field | E-series | T50 family |
+|---|---|---|
+| print buffer size | 4000 bytes | 4096 |
+| `per_line_byte` | 12 (96-dot head) | 48 (384-dot head) |
+| `margin_top` / `margin_bottom` | 1 / 1 | 8 / 8 |
+| `PAGE_REG` `mat` | 0 | 1 |
+| `PAGE_REG` `nodu` | 4, constant | mirrors density |
+| density byte `[12]` | up to 19, first buffer only | up to 15, every buffer |
+| `BUF_FULL` params | `(0, 0)` | `(compressed_len, speed)` |
+| transfer | one LZMA stream **per buffer** | one stream for the whole page |
+
+The captured 373-column page split into buffers of 332 and 41 columns —
+332 = `(4000 - 14) / 12`, reproduced by the
+`e10_split_matches_captured_vendor_page` test.
+
+Only the E10/E10pro is captured; E11/E12/E16 are routed onto the same profile
+because the T50 flow is known to print this class blank. See
+[`docs/E10-PROTOCOL.md`](E10-PROTOCOL.md) §11 for why the 96-dot head width is
+a safe floor for the series.
+
+Two vendor commands bracket `START_PRINT`; their parameters did not vary
+within the capture, so their meaning is still unknown:
+
+```
+0xC9 param=110      immediately before START_PRINT (param 0)
+0xBA param=29       after START_PRINT, before any data; acked with 0xBA
+```
+
+### `ribbon_end` is not fatal here
+
+The E10pro asserts MSTA-low `0x20` (`ribbon_end`) during prints the vendor app
+completes successfully. Treating it as an error aborts every job, so
+`PrinterStatus::has_error` — which takes the profile — ignores that bit here,
+as does `error_description`, so it can't be named as the cause of an unrelated
+failure either.
+
+### Not yet implemented
+
+The vendor also issues `0x18` after every `RETURN_MAT`, a `0xD0` bulk of one
+500-byte non-LZMA blob at connect, and `0xB0` carrying the current date as
+ASCII (`"20260729"`). Printing works without them.
+
+A decoder for these captures lives in
+[`scripts/btsnoop_supvan.py`](../scripts/btsnoop_supvan.py); the full annotated
+specification with captured evidence is in
+[`docs/E10-PROTOCOL.md`](E10-PROTOCOL.md).
