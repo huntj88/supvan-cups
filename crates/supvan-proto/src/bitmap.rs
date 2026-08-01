@@ -3,7 +3,11 @@ pub const DOTS_PER_MM: u32 = 8;
 pub const PRINTHEAD_WIDTH_MM: u32 = 48;
 pub const PRINTHEAD_WIDTH_DOTS: u32 = PRINTHEAD_WIDTH_MM * DOTS_PER_MM;
 pub const PRINTHEAD_BYTES_PER_LINE: u32 = PRINTHEAD_WIDTH_DOTS / 8;
+/// Blank columns before/after the image on [`PrintProfile::TSeries`]. Other
+/// profiles use [`ProfileParams::margin_dots`](crate::profile::ProfileParams::margin_dots).
 pub const DEFAULT_MARGIN_DOTS: u16 = 8;
+
+use crate::profile::PrintProfile;
 
 /// Convert a row-major MSB-first 1bpp bitmap (standard raster format) into
 /// column-major LSB-first 1bpp format suitable for the printer.
@@ -52,14 +56,15 @@ pub fn raster_to_column_major(input: &[u8], width: u32, height: u32) -> (Vec<u8>
 
 /// Center image data in a full-width printhead canvas.
 ///
-/// The printhead is a fixed physical bar (384 dots / 48 mm on the T50) and the
-/// media runs centred under it, so a page is always placed centred in a
-/// head-width canvas regardless of the label's own width.
+/// The printhead is a fixed physical bar (384 dots / 48 mm on the T50, 96 on
+/// an E10) and the media runs centred under it, so a page is always placed
+/// centred in a head-width canvas regardless of the label's own width.
 ///
 /// A page *wider* than the head is cropped symmetrically rather than padded.
 /// That is reachable in normal operation — the T50 family advertises 50 mm
-/// media on a 48 mm head — and CUPS renders the full media width because the
-/// IPP layer declares zero hard margins on all four sides.
+/// media on a 48 mm head, and the E-series runs 15 mm tape past a 12 mm head
+/// — and CUPS renders the full media width because the IPP layer declares
+/// zero hard margins on all four sides.
 ///
 /// Input: column-major LSB-first data with `input_bytes_per_line` per column.
 /// Output: column-major LSB-first data with `canvas_bytes_per_line` per column.
@@ -81,7 +86,9 @@ pub fn center_in_printhead(
         // Wider than the head: keep the *middle* of the image, because the
         // media runs centred under the printhead. Copying the leading bytes
         // instead drops one whole edge — a 50 mm label on the T50's 48 mm
-        // head lost 2 mm off the right rather than 1 mm off each side.
+        // head lost 2 mm off the right rather than 1 mm off each side, and on
+        // a 96-dot head fed the 120-dot page CUPS renders for 15 mm tape it is
+        // 3 mm off a single side, enough to delete the outer line of a label.
         let lost = input_width_dots - usable_width_dots;
         if lost > 0 {
             let left = lost / 2;
@@ -141,17 +148,33 @@ pub fn center_in_printhead(
 
 /// Create a test pattern matching the Python reference implementation.
 ///
+/// The canvas is the physical head, which is model-specific: centring a 48 mm
+/// canvas on a 12 mm head puts the whole pattern off the edge. `profile`
+/// decides where the per-buffer sub-patterns land, so it has to be the same
+/// profile [`split_into_buffers`](crate::buffer::split_into_buffers) is given
+/// — the boundaries the pattern draws are the point of the pattern.
+///
 /// Returns (image_bytes, canvas_width_dots, height_dots, bytes_per_line).
-pub fn create_test_pattern(label_width_mm: u32, height_mm: u32) -> (Vec<u8>, u32, u32, u32) {
-    let canvas_width_dots = PRINTHEAD_WIDTH_DOTS;
+pub fn create_test_pattern(
+    label_width_mm: u32,
+    height_mm: u32,
+    printhead_dots: u32,
+    profile: PrintProfile,
+) -> (Vec<u8>, u32, u32, u32) {
+    assert!(
+        printhead_dots > 0 && printhead_dots.is_multiple_of(8),
+        "printhead width {printhead_dots} must be a positive multiple of 8 dots"
+    );
+    let canvas_width_dots = printhead_dots;
     let height_dots = height_mm * DOTS_PER_MM;
-    let bytes_per_line = PRINTHEAD_BYTES_PER_LINE;
-    let label_width_dots = label_width_mm * DOTS_PER_MM;
+    let bytes_per_line = canvas_width_dots / 8;
+    // A label wider than the head can only print the head's worth of it.
+    let label_width_dots = (label_width_mm * DOTS_PER_MM).min(canvas_width_dots);
     let x_offset = (canvas_width_dots - label_width_dots) / 2;
 
-    let margin_top = DEFAULT_MARGIN_DOTS as u32;
-    let margin_bottom = DEFAULT_MARGIN_DOTS as u32;
-    let max_cols = (crate::buffer::MAX_BUF_DATA / bytes_per_line as usize) as u32;
+    let margin_top = profile.params().margin_dots as u32;
+    let margin_bottom = profile.params().margin_dots as u32;
+    let max_cols = crate::buffer::max_cols_per_buffer(bytes_per_line as u8, profile) as u32;
 
     // Compute buffer regions
     let mut buf_regions: Vec<(u32, u32)> = Vec::new();
@@ -258,17 +281,42 @@ mod tests {
 
     #[test]
     fn test_create_test_pattern_dimensions() {
-        let (data, w, h, bpl) = create_test_pattern(40, 30);
+        let (data, w, h, bpl) =
+            create_test_pattern(40, 30, PRINTHEAD_WIDTH_DOTS, PrintProfile::TSeries);
         assert_eq!(w, 384);
         assert_eq!(h, 240);
         assert_eq!(bpl, 48);
         assert_eq!(data.len(), 240 * 48);
     }
 
-    /// A page wider than the head must lose the same amount from both sides,
-    /// because the media runs centred under the printhead. Taking the leading
-    /// bytes instead drops one edge entirely — a 50 mm label on the T50's
-    /// 48 mm head lost 2 mm off the right rather than 1 mm off each side.
+    /// The pattern draws where the buffer boundaries fall, so it has to split
+    /// the page exactly as `split_into_buffers` will — using the T-series 4074
+    /// cap and 8-dot margins on an E10 would draw them in the wrong place.
+    #[test]
+    fn test_pattern_buffer_regions_match_the_real_split() {
+        let (data, w, h, bpl) = create_test_pattern(12, 60, 96, PrintProfile::ESeries);
+        assert_eq!(w, 96);
+        assert_eq!(bpl, 12);
+        assert_eq!(data.len(), (h * bpl) as usize);
+
+        let margin = PrintProfile::ESeries.params().margin_dots;
+        let bufs = crate::buffer::split_into_buffers(
+            &data,
+            bpl as u8,
+            h as u16,
+            margin,
+            margin,
+            4,
+            PrintProfile::ESeries,
+        );
+        let max_cols = crate::buffer::max_cols_per_buffer(bpl as u8, PrintProfile::ESeries) as u32;
+        let image_cols = h - margin as u32 * 2;
+        assert_eq!(bufs.len(), image_cols.div_ceil(max_cols) as usize);
+    }
+
+    /// A page wider than the head must lose the same amount from both sides.
+    /// Taking the leading bytes instead drops one edge entirely, which is how
+    /// a three-line 15 mm label lost its first line on a 96-dot E10pro head.
     #[test]
     fn oversized_input_is_cropped_symmetrically() {
         // One column, 120 dots wide: set only the outermost dot on each side.

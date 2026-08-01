@@ -76,20 +76,19 @@ pub fn decompress_lzma(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Compress concatenated print buffers for transfer.
 ///
-/// Takes a slice of 4096-byte print buffers, concatenates them, and compresses
-/// as a single LZMA stream. The printer's decoder reads the 14-byte header at
-/// each 4096-byte boundary internally, so a single LZMA stream covering N
-/// buffers is the right thing to send.
+/// Takes a slice of print buffers, concatenates them, and compresses as a
+/// single LZMA stream. The printer's decoder reads the 14-byte header at each
+/// buffer boundary internally, so a single LZMA stream covering N buffers is
+/// the right thing to send. The E-series wants one stream per buffer — see
+/// [`ProfileParams::per_buffer_transfer`](crate::profile::ProfileParams::per_buffer_transfer).
 ///
 /// Returns (compressed_data, average_compressed_per_buffer).
-pub fn compress_buffers(
-    buffers: &[[u8; crate::buffer::PRINT_BUF_SIZE]],
-) -> Result<(Vec<u8>, usize)> {
+pub fn compress_buffers(buffers: &[Vec<u8>]) -> Result<(Vec<u8>, usize)> {
     if buffers.is_empty() {
         return Err(Error::InvalidParam("no buffers to compress".into()));
     }
 
-    let mut concat = Vec::with_capacity(buffers.len() * crate::buffer::PRINT_BUF_SIZE);
+    let mut concat = Vec::with_capacity(buffers.iter().map(Vec::len).sum());
     for buf in buffers {
         concat.extend_from_slice(buf);
     }
@@ -140,8 +139,7 @@ mod tests {
 
     #[test]
     fn test_compress_buffers() {
-        let buf = [0u8; 4096];
-        let buffers = vec![buf; 3];
+        let buffers = vec![vec![0u8; 4096]; 3];
         let (compressed, avg) = compress_buffers(&buffers).unwrap();
         assert!(compressed.len() > 13); // at least header
         assert!(avg > 0);

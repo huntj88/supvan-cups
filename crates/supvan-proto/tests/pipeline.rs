@@ -10,6 +10,7 @@ use supvan_proto::bitmap::{
 };
 use supvan_proto::buffer::{MAX_BUF_DATA, PRINT_BUF_HEADER, PRINT_BUF_SIZE, split_into_buffers};
 use supvan_proto::compress::{compress_buffers, decompress_lzma};
+use supvan_proto::profile::PrintProfile;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -51,11 +52,7 @@ fn parse_pbm_p4(pbm: &[u8]) -> (u32, u32, usize) {
 
 /// Run the full pipeline on row-major MSB-first raster data and return
 /// (buffers, compressed, decompressed) for verification.
-fn run_pipeline(
-    raster: &[u8],
-    width: u32,
-    height: u32,
-) -> (Vec<[u8; PRINT_BUF_SIZE]>, Vec<u8>, Vec<u8>) {
+fn run_pipeline(raster: &[u8], width: u32, height: u32) -> (Vec<Vec<u8>>, Vec<u8>, Vec<u8>) {
     let (col_data, num_cols, _col_bpl) = raster_to_column_major(raster, width, height);
 
     let canvas_width_dots = PRINTHEAD_WIDTH_DOTS;
@@ -68,6 +65,7 @@ fn run_pipeline(
         DEFAULT_MARGIN_DOTS,
         DEFAULT_MARGIN_DOTS,
         4,
+        PrintProfile::TSeries,
     );
 
     let (compressed, _avg) = compress_buffers(&buffers).unwrap();
@@ -192,7 +190,8 @@ fn test_full_pipeline_checkerboard() {
 /// `split_into_buffers` → `compress_buffers` (skipping raster_to_column_major).
 #[test]
 fn test_full_pipeline_test_pattern() {
-    let (col_data, canvas_width_dots, height_dots, bytes_per_line) = create_test_pattern(40, 30);
+    let (col_data, canvas_width_dots, height_dots, bytes_per_line) =
+        create_test_pattern(40, 30, PRINTHEAD_WIDTH_DOTS, PrintProfile::TSeries);
 
     assert_eq!(canvas_width_dots, 384);
     assert_eq!(height_dots, 240);
@@ -205,6 +204,7 @@ fn test_full_pipeline_test_pattern() {
         DEFAULT_MARGIN_DOTS,
         DEFAULT_MARGIN_DOTS,
         4,
+        PrintProfile::TSeries,
     );
     assert_eq!(buffers.len(), 3);
 
@@ -261,6 +261,7 @@ fn test_pipeline_various_sizes() {
             DEFAULT_MARGIN_DOTS,
             DEFAULT_MARGIN_DOTS,
             4,
+            PrintProfile::TSeries,
         );
 
         // Verify expected buffer count

@@ -5,8 +5,10 @@
 //! transfer buffers -> poll complete.
 
 use crate::cmd::*;
+use crate::compress::compress_buffers;
 use crate::data::DATA_PAYLOAD_SIZE;
 use crate::error::{Error, Result};
+use crate::profile::PrintProfile;
 use crate::speed::calc_speed;
 use crate::status::{MaterialInfo, PrinterStatus};
 use crate::transport::Transport;
@@ -25,11 +27,33 @@ const COMPLETION_POLLS: usize = 300;
 /// High-level printer interface over a pluggable transport.
 pub struct Printer {
     transport: Box<dyn Transport>,
+    /// Wire-protocol variant this device speaks. A property of the printer,
+    /// not of any one call, so every step of the print flow reads it from
+    /// here rather than taking it as an argument.
+    profile: PrintProfile,
 }
 
 impl Printer {
     pub fn new(transport: Box<dyn Transport>) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            profile: PrintProfile::default(),
+        }
+    }
+
+    /// Select the wire-protocol variant. Callers that know the model (from
+    /// `RD_DEV_NAME` or the driver registry) set it once after opening.
+    ///
+    /// DEBUG, not INFO: a cached BT socket re-asserts the profile on every
+    /// open, so status polling alone logs this twice a minute per printer.
+    pub fn set_profile(&mut self, profile: PrintProfile) {
+        log::debug!("profile: {profile:?}");
+        self.profile = profile;
+    }
+
+    /// The wire-protocol variant currently selected.
+    pub fn profile(&self) -> PrintProfile {
+        self.profile
     }
 
     /// Open a USB HID printer at the given `/dev/hidrawN` path.
@@ -155,10 +179,9 @@ impl Printer {
         for _ in 0..max_attempts {
             let st = self.query_status().await?;
             if let Some(ref s) = st {
-                if s.has_error() {
+                if let Some(why) = s.error_description(self.profile) {
                     return Err(Error::InvalidResponse(format!(
-                        "printer error after START_PRINT: {}",
-                        s.error_description().unwrap_or_default()
+                        "printer error after START_PRINT: {why}"
                     )));
                 }
                 if s.printing {
@@ -176,10 +199,9 @@ impl Printer {
             tokio::time::sleep(Duration::from_millis(20)).await;
             let st = self.query_status().await?;
             if let Some(ref s) = st {
-                if s.has_error() {
+                if let Some(why) = s.error_description(self.profile) {
                     return Err(Error::InvalidResponse(format!(
-                        "printer error while waiting for buffer: {}",
-                        s.error_description().unwrap_or_default()
+                        "printer error while waiting for buffer: {why}"
                     )));
                 }
                 if !s.buf_full {
@@ -193,11 +215,18 @@ impl Printer {
         Ok(None)
     }
 
-    /// Transfer the compressed print buffers as a single LZMA stream:
-    /// NEXT_ZIPPEDBULK -> data packets -> BUF_FULL.
+    /// Transfer one LZMA stream: NEXT_ZIPPEDBULK -> data packets -> BUF_FULL.
     ///
-    /// The printer's decoder splits the decompressed stream on 4096-byte
-    /// boundaries internally, so one transfer covers all the page's buffers.
+    /// What a stream covers is the profile's business — see
+    /// [`print_page`](Self::print_page). On the T-series flow it is the whole
+    /// page, and the printer's decoder splits the decompressed result on
+    /// print-buffer boundaries internally; on the E-series it is exactly one
+    /// print buffer.
+    ///
+    /// `compressed_len` is only advisory: each transport encodes
+    /// `NEXT_ZIPPEDBULK` in its own convention (SPP framing always carries a
+    /// literal 512-byte block size plus the packet count, USB HID carries the
+    /// total compressed length), so this is not a per-model parameter.
     pub async fn transfer_compressed(&self, compressed: &[u8], speed: u16) -> Result<()> {
         let compressed_len = compressed.len() as u16;
 
@@ -231,25 +260,75 @@ impl Printer {
         // 20ms delay after last data packet
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        // CMD_BUF_FULL: param=compressed_length, param2=speed
-        log::info!("BUF_FULL: len={}, speed={}", compressed_len, speed);
-        self.transport
-            .send_cmd_two(CMD_BUF_FULL, compressed_len, speed)
-            .await?;
+        // CMD_BUF_FULL: the T-series reports (length, speed); the E-series sends zeroes.
+        let (p1, p2) = if self.profile.params().buf_full_reports_length {
+            (compressed_len, speed)
+        } else {
+            (0, 0)
+        };
+        log::info!("BUF_FULL: param={p1}, param2={p2}");
+        self.transport.send_cmd_two(CMD_BUF_FULL, p1, p2).await?;
 
         Ok(())
     }
 
-    /// Execute a full print job with pre-compressed data.
+    /// Execute a full print job from built print buffers.
     ///
     /// This is the main print flow from T50PlusPrint.doPrint():
+    /// 0. Compress
     /// 1. CHECK_DEVICE
     /// 2. Wait ready
-    /// 3. START_PRINT
+    /// 3. START_PRINT (bracketed by the profile's vendor commands)
     /// 4. Wait printing station
     /// 5. Wait buffer ready + transfer
     /// 6. Wait completion
-    pub async fn print_compressed(&self, compressed: &[u8], speed: u16) -> Result<()> {
+    ///
+    /// Compression happens here rather than in the caller because the split is
+    /// profile-dependent: the T-series concatenates the whole page into one LZMA
+    /// stream, the E-series ships one stream per buffer. It is done up front,
+    /// before `CHECK_DEVICE`, so that no LZMA pass ever runs between
+    /// `START_PRINT` and the first data packet — the printer is live from that
+    /// point on and times out waiting for data.
+    ///
+    /// Every buffer must be exactly the profile's `buf_size`: the firmware
+    /// splits the decompressed stream on that fixed stride and reads a
+    /// 14-byte header at each boundary, so a wrongly-sized buffer compresses
+    /// and transfers fine but decodes as garbage. [`split_into_buffers`](crate::buffer::split_into_buffers) always
+    /// emits the right size; this rejects anything else rather than printing it.
+    pub async fn print_page(&self, buffers: &[Vec<u8>]) -> Result<()> {
+        if buffers.is_empty() {
+            return Err(Error::InvalidParam("no print buffers".into()));
+        }
+        let buf_size = self.profile.params().buf_size;
+        if let Some((i, bad)) = buffers
+            .iter()
+            .enumerate()
+            .find(|(_, b)| b.len() != buf_size)
+        {
+            return Err(Error::InvalidParam(format!(
+                "print buffer {i} is {} bytes, but {:?} requires exactly {buf_size}",
+                bad.len(),
+                self.profile
+            )));
+        }
+
+        // Step 0: Compress every chunk before the printer is started.
+        let per_chunk = if self.profile.params().per_buffer_transfer {
+            1
+        } else {
+            buffers.len()
+        };
+        let mut streams = Vec::new();
+        for chunk in buffers.chunks(per_chunk) {
+            let (compressed, avg) = compress_buffers(chunk)?;
+            streams.push((compressed, calc_speed(avg)));
+        }
+        log::info!(
+            "print_page: {} buffers -> {} LZMA stream(s)",
+            buffers.len(),
+            streams.len()
+        );
+
         // Step 1: Check device
         if !self.check_device().await? {
             return Err(Error::InvalidResponse("CHECK_DEVICE failed".into()));
@@ -260,14 +339,15 @@ impl Printer {
             .wait_ready(READY_ATTEMPTS)
             .await?
             .ok_or_else(|| Error::InvalidResponse("timeout waiting for device ready".into()))?;
-        if status.has_error() {
-            return Err(Error::InvalidResponse(format!(
-                "printer error: {}",
-                status.error_description().unwrap_or_default()
-            )));
+        if let Some(why) = status.error_description(self.profile) {
+            return Err(Error::InvalidResponse(format!("printer error: {why}")));
         }
 
-        // Step 3: Start print
+        // Step 3: Start print, bracketed by the profile's vendor commands.
+        if let Some((cmd, param)) = self.profile.params().pre_start_cmd {
+            log::info!("pre-start 0x{cmd:02X}({param})");
+            self.transport.send_cmd(cmd, param).await?;
+        }
         self.start_print().await?;
 
         // Step 4: Wait printing station
@@ -275,19 +355,24 @@ impl Printer {
             .await?
             .ok_or_else(|| Error::InvalidResponse("timeout waiting for printing station".into()))?;
 
-        // Step 5: Wait buffer + transfer
-        let buf_status = self
-            .wait_buffer_ready(BUFFER_READY_ATTEMPTS)
-            .await?
-            .ok_or_else(|| Error::InvalidResponse("timeout waiting for buffer space".into()))?;
-        if buf_status.has_error() {
-            self.stop_print().await?;
-            return Err(Error::InvalidResponse(format!(
-                "printer error: {}",
-                buf_status.error_description().unwrap_or_default()
-            )));
+        if let Some((cmd, param)) = self.profile.params().post_start_cmd {
+            log::info!("post-start 0x{cmd:02X}({param})");
+            self.transport.send_cmd(cmd, param).await?;
         }
-        self.transfer_compressed(compressed, speed).await?;
+
+        // Step 5: Transfer, one LZMA stream per chunk, each with its own
+        // BUF_FULL.
+        for (compressed, speed) in &streams {
+            let buf_status = self
+                .wait_buffer_ready(BUFFER_READY_ATTEMPTS)
+                .await?
+                .ok_or_else(|| Error::InvalidResponse("timeout waiting for buffer space".into()))?;
+            if let Some(why) = buf_status.error_description(self.profile) {
+                self.stop_print().await?;
+                return Err(Error::InvalidResponse(format!("printer error: {why}")));
+            }
+            self.transfer_compressed(compressed, *speed).await?;
+        }
 
         // Step 6: Wait completion
         for _ in 0..COMPLETION_POLLS {
@@ -305,13 +390,20 @@ impl Printer {
         Err(Error::Timeout("print completion"))
     }
 
-    /// Full test print workflow: generate test pattern, build buffers, compress, print.
+    /// Full test print workflow: generate test pattern, build buffers, print.
+    ///
+    /// Uses [`ProfileParams::default_printhead_dots`](crate::profile::ProfileParams::default_printhead_dots)
+    /// for the canvas, which is right for the reference model of each profile.
+    /// `supvan-printer-app` does not use this path — it takes the head width
+    /// from the driver registry, which knows the difference between a T50 and
+    /// a TP80.
     pub async fn test_print(&self, mat: &MaterialInfo, density: u8) -> Result<()> {
         use crate::bitmap::create_test_pattern;
         use crate::buffer::split_into_buffers;
-        use crate::compress::compress_buffers;
 
-        let label_width_mm = (mat.width_mm as u32).min(crate::bitmap::PRINTHEAD_WIDTH_MM);
+        let printhead_dots = self.profile.params().default_printhead_dots;
+        // Cap at the model's own head, not the 48 mm T50 assumption.
+        let label_width_mm = (mat.width_mm as u32).min(printhead_dots / crate::bitmap::DOTS_PER_MM);
         let height_mm = if mat.height_mm == 0 {
             crate::status::DEFAULT_LABEL_HEIGHT_MM as u32
         } else {
@@ -325,19 +417,114 @@ impl Printer {
             density
         );
 
-        let (image_data, _w, h, bpl) = create_test_pattern(label_width_mm, height_mm);
-        let buffers = split_into_buffers(&image_data, bpl as u8, h as u16, 8, 8, density);
+        let (image_data, _w, h, bpl) =
+            create_test_pattern(label_width_mm, height_mm, printhead_dots, self.profile);
+        let margin = self.profile.params().margin_dots;
+        let buffers = split_into_buffers(
+            &image_data,
+            bpl as u8,
+            h as u16,
+            margin,
+            margin,
+            density,
+            self.profile,
+        );
         log::info!("{} print buffers", buffers.len());
 
-        let (compressed, avg) = compress_buffers(&buffers)?;
-        let speed = calc_speed(avg);
-        log::info!(
-            "compressed: {} bytes, avg={}/buf, speed={}",
-            compressed.len(),
-            avg,
-            speed
-        );
+        self.print_page(&buffers).await
+    }
+}
 
-        self.print_compressed(&compressed, speed).await
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::{max_cols_per_buffer, split_into_buffers};
+
+    /// The guard rejects before any I/O, so every method may panic.
+    struct NeverCalled;
+
+    #[async_trait::async_trait]
+    impl Transport for NeverCalled {
+        async fn send_cmd(&self, _: u8, _: u16) -> Result<Option<Vec<u8>>> {
+            unreachable!("print_page must reject bad buffers before talking to the printer")
+        }
+        async fn send_cmd_two(&self, _: u8, _: u16, _: u16) -> Result<Option<Vec<u8>>> {
+            unreachable!()
+        }
+        async fn send_bulk_header(&self, _: u16, _: usize) -> Result<Option<Vec<u8>>> {
+            unreachable!()
+        }
+        async fn send_bulk_data(&self, _: &[u8], _: bool) -> Result<Option<Vec<u8>>> {
+            unreachable!()
+        }
+        fn parse_status_response(&self, _: &[u8]) -> Option<PrinterStatus> {
+            None
+        }
+        fn parse_material_response(&self, _: &[u8]) -> Option<MaterialInfo> {
+            None
+        }
+        fn validate_response(&self, _: &[u8], _: u8) -> bool {
+            false
+        }
+        fn parse_device_name_response(&self, _: &[u8]) -> Option<String> {
+            None
+        }
+        fn parse_firmware_version_response(&self, _: &[u8]) -> Option<u8> {
+            None
+        }
+        fn parse_version_response(&self, _: &[u8]) -> Option<String> {
+            None
+        }
+    }
+
+    fn printer(profile: PrintProfile) -> Printer {
+        let mut p = Printer::new(Box::new(NeverCalled));
+        p.set_profile(profile);
+        p
+    }
+
+    /// `supvan-proto` does not pull in tokio's `macros` feature, so tests
+    /// drive the futures on a current-thread runtime themselves.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(fut)
+    }
+
+    #[test]
+    fn print_page_rejects_buffers_sized_for_another_profile() {
+        // A T-series page handed to an E-series printer: compression would
+        // succeed, but the firmware splits the stream every 4000 bytes.
+        let t_buffers = vec![vec![0u8; PrintProfile::TSeries.params().buf_size]];
+        let err = block_on(printer(PrintProfile::ESeries).print_page(&t_buffers)).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidParam(m) if m.contains("4096") && m.contains("4000")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn print_page_rejects_empty_buffer_list() {
+        assert!(matches!(
+            block_on(printer(PrintProfile::TSeries).print_page(&[])),
+            Err(Error::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn split_into_buffers_output_passes_the_guard() {
+        // The guard must not reject the one producer the driver actually uses,
+        // including the short final buffer of a page.
+        for profile in [PrintProfile::TSeries, PrintProfile::ESeries] {
+            let per_line = 12u8;
+            let margin = profile.params().margin_dots;
+            let cols = max_cols_per_buffer(per_line, profile) + margin * 2 + 7;
+            let image = vec![0u8; cols as usize * per_line as usize];
+            let buffers = split_into_buffers(&image, per_line, cols, margin, margin, 4, profile);
+            assert!(buffers.len() > 1, "{profile:?} should need several buffers");
+            let buf_size = profile.params().buf_size;
+            assert!(buffers.iter().all(|b| b.len() == buf_size));
+        }
     }
 }

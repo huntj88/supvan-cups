@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use supvan_proto::error::{Error as ProtoError, Result as ProtoResult};
 use supvan_proto::printer::Printer;
+use supvan_proto::profile::PrintProfile;
 use supvan_proto::status::PrinterStatus;
 use tokio::sync::Mutex;
 
@@ -37,11 +38,13 @@ impl PrinterHandle {
         }
     }
 
-    /// Stream the compressed raster + speed to the device.
-    pub async fn print_compressed(&self, compressed: &[u8], speed: u16) -> ProtoResult<()> {
+    /// Run a page through the device's print flow. Compression and the
+    /// per-buffer split are the profile's business, so the buffers go across
+    /// uncompressed — see [`Printer::print_page`].
+    pub async fn print_page(&self, buffers: &[Vec<u8>]) -> ProtoResult<()> {
         match self {
-            Self::Owned(p) => p.print_compressed(compressed, speed).await,
-            Self::Shared(arc) => arc.lock().await.print_compressed(compressed, speed).await,
+            Self::Owned(p) => p.print_page(buffers).await,
+            Self::Shared(arc) => arc.lock().await.print_page(buffers).await,
         }
     }
 
@@ -59,14 +62,19 @@ pub struct KsDevice {
     pub printer: Option<PrinterHandle>,
     /// Guards status queries during active raster transfer.
     pub printing: AtomicBool,
+    /// Wire-protocol variant this printer speaks, resolved from its driver
+    /// family when the device was opened. Status decoding and page layout
+    /// both depend on it, so it is carried here rather than re-derived.
+    profile: PrintProfile,
 }
 
 impl KsDevice {
     /// Wrap a printer that lives in the BT cache.
-    pub fn from_shared(printer: Arc<Mutex<Printer>>) -> Self {
+    pub fn from_shared(printer: Arc<Mutex<Printer>>, profile: PrintProfile) -> Self {
         KsDevice {
             printer: Some(PrinterHandle::Shared(printer)),
             printing: AtomicBool::new(false),
+            profile,
         }
     }
 
@@ -76,32 +84,41 @@ impl KsDevice {
         KsDevice {
             printer: None,
             printing: AtomicBool::new(false),
+            profile: PrintProfile::default(),
         }
     }
 
+    /// The wire-protocol variant this device speaks.
+    pub fn profile(&self) -> PrintProfile {
+        self.profile
+    }
+
     /// Open a USB HID connection to the printer at `hidraw_path` (e.g. "/dev/hidraw7").
-    pub fn open_usb(hidraw_path: &str) -> Option<Box<Self>> {
+    pub fn open_usb(hidraw_path: &str, profile: PrintProfile) -> Option<Box<Self>> {
         if is_mock_mode() {
             log::info!("KsDevice::open_usb: MOCK mode — skipping USB open to {hidraw_path}");
             return Some(Box::new(KsDevice {
                 printer: None,
                 printing: AtomicBool::new(false),
+                profile,
             }));
         }
 
         log::info!("KsDevice::open_usb: opening {hidraw_path}");
-        let printer = match Printer::open_usb(hidraw_path) {
+        let mut printer = match Printer::open_usb(hidraw_path) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("KsDevice::open_usb: hidraw open failed: {e}");
                 return None;
             }
         };
+        printer.set_profile(profile);
 
         log::debug!("KsDevice::open_usb: opened {hidraw_path}");
         Some(Box::new(KsDevice {
             printer: Some(PrinterHandle::Owned(printer)),
             printing: AtomicBool::new(false),
+            profile,
         }))
     }
 
@@ -137,7 +154,7 @@ impl KsDevice {
             }
         };
 
-        crate::job::reasons_from_status(&status)
+        crate::job::reasons_from_status(&status, self.profile)
     }
 
     /// Check if this is a mock device (no real printer connection).

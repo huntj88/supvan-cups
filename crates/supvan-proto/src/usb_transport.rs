@@ -216,6 +216,7 @@ impl Transport for UsbHidTransport {
 mod tests {
     use super::*;
     use crate::cmd;
+    use crate::profile::PrintProfile;
 
     #[test]
     fn test_make_usb_cmd() {
@@ -257,7 +258,7 @@ mod tests {
         assert!(status.printing);
         assert!(!status.buf_full);
         assert!(!status.device_busy);
-        assert!(!status.has_error());
+        assert!(!status.has_error(PrintProfile::default()));
     }
 
     #[test]
@@ -267,7 +268,7 @@ mod tests {
         assert!(status.label_rw_error);
         assert!(status.cover_open);
         assert!(status.label_not_installed);
-        assert!(status.has_error());
+        assert!(status.has_error(PrintProfile::default()));
         assert_eq!(status.print_count, 5);
     }
 

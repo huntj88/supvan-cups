@@ -9,36 +9,62 @@ use print_raster::reader::{RasterPageReader, RasterReader};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::job::KsJob;
+
 use crate::models;
 
 /// Printhead resolution in dots per millimetre (matches supvan-proto).
 const DOTS_PER_MM: i32 = 8;
 
+/// The printer a job is bound for: the subset of [`PrinterConfig`] both job
+/// paths need. `driver_name` is not decorative — it selects the wire protocol
+/// (see [`models::profile_for_driver`]) as well as labelling the queue.
+#[derive(Clone, Copy)]
+pub struct JobTarget<'a> {
+    pub printer_name: &'a str,
+    pub device_uri: &'a str,
+    pub driver_name: &'a str,
+    pub printhead_width_dots: u32,
+    pub darkness: i32,
+}
+
+impl<'a> From<&'a ipp_printer_app::PrinterConfig> for JobTarget<'a> {
+    fn from(cfg: &'a ipp_printer_app::PrinterConfig) -> Self {
+        JobTarget {
+            printer_name: &cfg.name,
+            device_uri: &cfg.device_uri,
+            driver_name: &cfg.driver_name,
+            printhead_width_dots: cfg.printhead_width_dots,
+            darkness: cfg.darkness,
+        }
+    }
+}
+
+impl JobTarget<'_> {
+    /// Open the device, resolving its wire protocol from the driver family.
+    async fn open(&self) -> Result<crate::printer_device::KsDevice, JobFailure> {
+        crate::device::open_uri(
+            self.device_uri,
+            models::profile_for_driver(self.driver_name),
+        )
+        .await
+        .ok_or_else(|| {
+            JobFailure::new(
+                ipp_printer_app::PrinterReason::OFFLINE,
+                format!("cannot open device {}", self.device_uri),
+            )
+        })
+    }
+}
+
 /// Run a full CUPS raster document through [`KsJob`]. Runs on the caller's
 /// tokio runtime (the framework's print worker) — no nested runtime.
 pub async fn run_cups_raster_job(
-    printer_name: &str,
-    device_uri: &str,
-    darkness: i32,
-    printhead_width_dots: u32,
-    driver_name: &str,
+    target: JobTarget<'_>,
     raster: &[u8],
     copies_override: u32,
 ) -> Result<(), JobFailure> {
-    let dev = crate::device::open_uri(device_uri).await.ok_or_else(|| {
-        JobFailure::new(
-            ipp_printer_app::PrinterReason::OFFLINE,
-            format!("cannot open device {device_uri}"),
-        )
-    })?;
-
-    let record = job_record(
-        printer_name,
-        device_uri,
-        driver_name,
-        printhead_width_dots,
-        darkness,
-    );
+    let dev = target.open().await?;
+    let record = job_record(target);
     let handle = PrinterHandle { record: &record };
 
     let cursor = Cursor::new(raster);
@@ -109,25 +135,19 @@ pub async fn run_cups_raster_job(
 /// Build the throwaway [`PrinterRecord`] that backs the [`PrinterHandle`] a
 /// [`KsJob`] reads (only `darkness` + `printhead_width_dots` matter). Shared by
 /// the raster and JPEG paths.
-fn job_record(
-    printer_name: &str,
-    device_uri: &str,
-    driver_name: &str,
-    printhead_width_dots: u32,
-    darkness: i32,
-) -> ipp_printer_app::PrinterRecord {
+fn job_record(target: JobTarget<'_>) -> ipp_printer_app::PrinterRecord {
     ipp_printer_app::PrinterRecord::new(ipp_printer_app::PrinterConfig {
-        name: printer_name.to_string(),
+        name: target.printer_name.to_string(),
         display_name: String::new(),
-        driver_name: driver_name.to_string(),
+        driver_name: target.driver_name.to_string(),
         make_and_model: String::new(),
         device_id: String::new(),
-        device_uri: device_uri.to_string(),
+        device_uri: target.device_uri.to_string(),
         dpi: 203,
-        printhead_width_dots,
+        printhead_width_dots: target.printhead_width_dots,
         media_names: vec![],
         media_sizes: vec![],
-        darkness,
+        darkness: target.darkness,
         document_formats: vec![],
     })
 }
@@ -139,10 +159,7 @@ fn job_record(
 /// JPEG decode + fit is synchronous; the device transfer is awaited like the
 /// raster path. Runs on the caller's tokio runtime (the print worker).
 pub async fn run_jpeg_job(
-    printer_name: &str,
-    device_uri: &str,
-    darkness: i32,
-    printhead_width_dots: u32,
+    target: JobTarget<'_>,
     media_size_hmm: [i32; 2],
     jpeg: &[u8],
     copies: u32,
@@ -151,22 +168,15 @@ pub async fn run_jpeg_job(
         .map_err(|e| JobFailure::other(format!("jpeg decode: {e}")))?
         .to_luma8();
 
-    let (canvas, label_w, label_h) = fit_luma(&img, media_size_hmm, printhead_width_dots);
+    let (canvas, label_w, label_h) = fit_luma(&img, media_size_hmm, target.printhead_width_dots);
     if label_w == 0 || label_h == 0 {
         return Err(JobFailure::other(format!(
             "jpeg: empty label geometry from media_size {media_size_hmm:?}"
         )));
     }
 
-    let dev = crate::device::open_uri(device_uri).await.ok_or_else(|| {
-        JobFailure::new(
-            ipp_printer_app::PrinterReason::OFFLINE,
-            format!("cannot open device {device_uri}"),
-        )
-    })?;
-    // The throwaway record only feeds KsJob's darkness + printhead width; the
-    // driver name is irrelevant on this path.
-    let record = job_record(printer_name, device_uri, "", printhead_width_dots, darkness);
+    let dev = target.open().await?;
+    let record = job_record(target);
     let handle = PrinterHandle { record: &record };
 
     // 8bpp grayscale, one byte per pixel; KsJob's 8bpp branch dithers each row.

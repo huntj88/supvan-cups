@@ -257,11 +257,20 @@ where
 pub struct BtCandidate {
     pub address: String,
     pub name: String,
+    /// The firmware's marketing model name from `RD_DEV_NAME` (e.g. `E10pro`),
+    /// or `None` when it hasn't been read. `name` only carries the serial, so
+    /// this is the only way a BT-only printer can be identified by model.
+    ///
+    /// Enumeration leaves this `None`: reading it costs an exclusive RFCOMM
+    /// connection, and whether that is worth spending is a registry decision,
+    /// not a BlueZ one. [`SupvanDeviceBackend::list`](crate::ipp_server::SupvanDeviceBackend) fills
+    /// it in for the candidates where it can still change the outcome.
+    pub model_name: Option<String>,
 }
 
 /// Like [`discover`] but returns structured candidates instead of invoking a
 /// callback. Used by the unified cross-transport list in
-/// [`crate::ipp_server::SupvanDeviceBackend::list`].
+/// [`SupvanDeviceBackend::list`](crate::ipp_server::SupvanDeviceBackend).
 pub fn list_candidates() -> Vec<BtCandidate> {
     let mut out = Vec::new();
     discover(|info, uri, _id| {
@@ -278,6 +287,7 @@ pub fn list_candidates() -> Vec<BtCandidate> {
             out.push(BtCandidate {
                 address: addr.to_string(),
                 name,
+                model_name: None,
             });
         }
         true

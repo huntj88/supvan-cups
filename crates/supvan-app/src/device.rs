@@ -14,12 +14,14 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use supvan_proto::printer::Printer;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::battery_provider;
 use crate::printer_device::KsDevice;
+use supvan_proto::profile::PrintProfile;
 
 /// BT printer connection cache, keyed by address. Persists across `open_bt`
 /// calls so the status poller and print jobs reuse one RFCOMM socket per
@@ -29,6 +31,11 @@ fn bt_cache() -> &'static Mutex<HashMap<String, Arc<AsyncMutex<Printer>>>> {
     static CACHE: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<Printer>>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+/// How long discovery will wait on a single printer's model-name probe.
+/// Comfortably above a healthy connect + `RD_DEV_NAME` round trip, well below
+/// the kernel's RFCOMM connect timeout for an absent device.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 
 fn dial_bt(addr: &str) -> Option<Printer> {
     log::info!("device::open_bt: dialing {addr} (no cache entry)");
@@ -44,7 +51,7 @@ fn dial_bt(addr: &str) -> Option<Printer> {
 /// Open `btrfcomm://host/path/AA:BB:CC:DD:EE:FF`, reusing a cached RFCOMM
 /// socket when one is available. Drops the cache entry and reconnects if the
 /// existing socket no longer responds.
-pub async fn open_bt(uri: &str) -> Option<Box<KsDevice>> {
+pub async fn open_bt(uri: &str, profile: PrintProfile) -> Option<Box<KsDevice>> {
     let addr = uri
         .strip_prefix("btrfcomm://")
         .and_then(|rest| rest.find('/').map(|pos| &rest[pos + 1..]))?;
@@ -60,22 +67,41 @@ pub async fn open_bt(uri: &str) -> Option<Box<KsDevice>> {
             } else {
                 log::info!("device::open_bt: cached socket for {addr} is dead, reconnecting");
                 bt_cache().lock().unwrap().remove(addr);
-                dial_and_cache(addr)?
+                dial_and_cache(addr).await?
             }
         }
-        None => dial_and_cache(addr)?,
+        None => dial_and_cache(addr).await?,
     };
 
     if let Some(h) = battery_provider::handle() {
         h.add_device(addr, 100);
     }
-    Some(Box::new(KsDevice::from_shared(printer)))
+    // The socket is cached across jobs, so re-assert the profile: this printer
+    // may have been dialled by a bare `RD_DEV_NAME` probe that knew no model.
+    printer.lock().await.set_profile(profile);
+    Some(Box::new(KsDevice::from_shared(printer, profile)))
 }
 
 /// Dial a fresh RFCOMM socket for `addr` and insert it into the connection
 /// cache, returning the shared handle.
-fn dial_and_cache(addr: &str) -> Option<Arc<AsyncMutex<Printer>>> {
-    let arced = Arc::new(AsyncMutex::new(dial_bt(addr)?));
+///
+/// `libc::connect` on an RFCOMM socket has no timeout of its own: for a
+/// powered-off printer it blocks until the kernel's page timeout, tens of
+/// seconds later. It runs on the blocking pool so a caller that gives up
+/// first — see [`probe_bt_model_name`] — still releases its task on time.
+///
+/// The blocking call is *not* cancelled, so N unreachable printers tie up N
+/// pool threads until the kernel returns (nothing is cached or leaked). That
+/// is bounded — 512 threads by default, and only BlueZ-advertised candidates
+/// are probed — so it is accepted; fixing it properly means a non-blocking
+/// connect plus `poll` in [`supvan_proto::rfcomm`].
+async fn dial_and_cache(addr: &str) -> Option<Arc<AsyncMutex<Printer>>> {
+    let owned = addr.to_string();
+    let printer = tokio::task::spawn_blocking(move || dial_bt(&owned))
+        .await
+        .ok()
+        .flatten()?;
+    let arced = Arc::new(AsyncMutex::new(printer));
     bt_cache()
         .lock()
         .unwrap()
@@ -83,12 +109,60 @@ fn dial_and_cache(addr: &str) -> Option<Arc<AsyncMutex<Printer>>> {
     Some(arced)
 }
 
+/// Read the firmware's own model name over BT (`RD_DEV_NAME`, e.g. `E10pro`).
+///
+/// BlueZ only exposes the firmware *serial* name (`T0143F2408183024`), the
+/// cross-transport join key, which says nothing about the model. The marketing
+/// name is only reachable on the wire and becomes the `MDL:` field that picks
+/// the driver family — without it every E-series unit lands on the T50 driver
+/// and prints nothing.
+///
+/// Reuses the cached RFCOMM socket, dialling and caching on first sight. An
+/// RFCOMM socket is exclusive on most of these printers, so holding one locks
+/// the vendor app out: probe only where the model changes the outcome, per
+/// [`SupvanDeviceBackend::needs_model_probe`](crate::ipp_server::SupvanDeviceBackend).
+///
+/// Bounded by [`PROBE_TIMEOUT`]. Giving up costs only the model name, but the
+/// underlying connect keeps running on the blocking pool — see
+/// [`dial_and_cache`]. BT-only: the 8-byte USB HID status frame can't carry a
+/// string (see [`crate::usb_discover`]).
+pub async fn probe_bt_model_name(addr: &str) -> Option<String> {
+    match tokio::time::timeout(PROBE_TIMEOUT, probe_bt_model_name_inner(addr)).await {
+        Ok(name) => name,
+        Err(_) => {
+            log::warn!(
+                "device::probe_bt_model_name: {addr}: gave up after {PROBE_TIMEOUT:?}; \
+                 the driver family will fall back to its default"
+            );
+            None
+        }
+    }
+}
+
+async fn probe_bt_model_name_inner(addr: &str) -> Option<String> {
+    let cached = bt_cache().lock().unwrap().get(addr).cloned();
+    let printer = match cached {
+        Some(arc) => arc,
+        None => dial_and_cache(addr).await?,
+    };
+    let name = match printer.lock().await.read_device_name().await {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("device::probe_bt_model_name: {addr}: RD_DEV_NAME failed: {e}");
+            return None;
+        }
+    };
+    let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    log::info!("device::probe_bt_model_name: {addr} -> {name:?}");
+    name
+}
+
 /// Open a device from its URI, dispatching on the scheme: `supvan://` resolves
 /// through the discovery transport map, `mock://` yields a simulator device.
 /// Any other scheme is unsupported and returns `None`.
-pub async fn open_uri(uri: &str) -> Option<KsDevice> {
+pub async fn open_uri(uri: &str, profile: PrintProfile) -> Option<KsDevice> {
     if uri.starts_with("supvan://") {
-        open_supvan(uri).await
+        open_supvan(uri, profile).await
     } else if uri.starts_with("mock://") {
         open_mock(uri)
     } else {
@@ -123,7 +197,7 @@ fn supvan_map() -> &'static Mutex<HashMap<String, SupvanTransports>> {
 }
 
 /// Record the active USB and/or BT transports for a `supvan://<slug>` printer.
-/// Called from [`crate::ipp_server::SupvanDeviceBackend::list`] after each
+/// Called from [`SupvanDeviceBackend::list`](crate::ipp_server::SupvanDeviceBackend) after each
 /// discovery cycle.
 pub fn register_supvan(
     slug: &str,
@@ -144,12 +218,12 @@ pub fn register_supvan(
 /// Open `supvan://<slug>`. Prefers USB when available, falls back to the
 /// cached BT socket. Returns `None` if neither transport is registered or
 /// both fail to open.
-pub async fn open_supvan(uri: &str) -> Option<KsDevice> {
+pub async fn open_supvan(uri: &str, profile: PrintProfile) -> Option<KsDevice> {
     let slug = uri.strip_prefix("supvan://")?;
     let entry = supvan_map().lock().unwrap().get(slug).cloned()?;
 
     if let Some(path) = entry.hidraw_path.as_deref() {
-        if let Some(dev) = KsDevice::open_usb(path) {
+        if let Some(dev) = KsDevice::open_usb(path, profile) {
             return Some(*dev);
         }
         log::warn!("open_supvan: USB open failed for {slug} ({path}), falling back to BT");
@@ -157,13 +231,13 @@ pub async fn open_supvan(uri: &str) -> Option<KsDevice> {
     if let Some(addr) = entry.bt_address.as_deref() {
         // open_bt expects a full URI; synthesize one.
         let uri = format!("btrfcomm://bt/{addr}");
-        if let Some(dev) = open_bt(&uri).await {
+        if let Some(dev) = open_bt(&uri, profile).await {
             return Some(*dev);
         }
         log::warn!("open_supvan: BT open failed for {slug} ({addr}), trying BLE");
     }
     if let Some(addr) = entry.ble_address.as_deref() {
-        return open_ble_addr(addr).await.map(|b| *b);
+        return open_ble_addr(addr, profile).await.map(|b| *b);
     }
     log::warn!("open_supvan: no transports for {slug}");
     None
@@ -172,7 +246,7 @@ pub async fn open_supvan(uri: &str) -> Option<KsDevice> {
 /// Open a BLE printer by address, reusing a cached GATT connection. Stub
 /// (returns `None`) without the `ble` feature.
 #[cfg(feature = "ble")]
-async fn open_ble_addr(addr: &str) -> Option<Box<KsDevice>> {
+async fn open_ble_addr(addr: &str, profile: PrintProfile) -> Option<Box<KsDevice>> {
     let cached = ble_cache().lock().unwrap().get(addr).cloned();
     let printer = match cached {
         Some(arc) => {
@@ -187,11 +261,12 @@ async fn open_ble_addr(addr: &str) -> Option<Box<KsDevice>> {
         }
         None => dial_ble_and_cache(addr).await?,
     };
-    Some(Box::new(KsDevice::from_shared(printer)))
+    printer.lock().await.set_profile(profile);
+    Some(Box::new(KsDevice::from_shared(printer, profile)))
 }
 
 #[cfg(not(feature = "ble"))]
-async fn open_ble_addr(addr: &str) -> Option<Box<KsDevice>> {
+async fn open_ble_addr(addr: &str, _profile: PrintProfile) -> Option<Box<KsDevice>> {
     log::warn!("device: BLE address {addr} registered but the `ble` feature is off");
     None
 }
