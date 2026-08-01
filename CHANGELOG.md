@@ -46,6 +46,32 @@ minor version).
   wholesale. Deciding that is registry policy, so it lives in the device
   backend; `discover::list_candidates` stays a probe-free BlueZ enumeration.
 
+- **Short and arbitrary label lengths on the E-series.** `data/models.toml`
+  families may now carry a `media_ladder` — `{ widths, from, steps }` — that
+  expands into extra advertised lengths at load. The E10 family gets rungs from
+  4 mm to 1 m, so a one-word label no longer has to round up to the 20 mm
+  shortest stock size. Continuous tape has no gap to register against, so any
+  length prints; the ladder exists only because CUPS can request nothing but
+  the sizes the PPD enumerates.
+
+  Two measured constraints are enforced at load: rungs must be **≥ 2 mm apart**
+  (at 1 mm spacing CUPS hands the driver a raster a millimetre short of the
+  requested size, clipping the label), and a family may advertise at most 400
+  sizes (CUPS silently truncates the generated PPD past ~470, and a size that
+  reaches a client but not the PPD crashes cups-filters' `universal` filter).
+  Both are documented in `docs/E10-PROTOCOL.md` §4.1.2, along with the
+  `*CustomPageSize` approach that would remove the ladder entirely once
+  `ipp-printer-app` can advertise size ranges. Die-cut families (T50/T80/G/TP)
+  omit the ladder, since their stock only registers at its real sizes.
+
+- **Generic Supvan device matching.** A printer whose firmware hardware code
+  isn't listed in `bt_patterns` is now discoverable via its serial-name shape
+  (`[TGD]\d\d…`) inside Supvan's `A4:93:40` OUI, instead of being invisible.
+  The classic-BT and BLE scanners share one implementation. Because the shape
+  is deliberately loose, classic-BT auto-pairing now also skips a device that
+  advertises profiles but not Serial Port, so a widened match can't turn into
+  pairing prompts for hardware the driver could never talk to.
+
 ### Changed
 
 - `Printer` owns its `PrintProfile`, set once when the transport is opened, so
@@ -71,6 +97,13 @@ minor version).
   `supvan_t50`.** Upgrading: an E-series queue configured against an older
   release still names the `supvan_t50` driver and will keep printing blank.
   Remove and re-add it so discovery re-resolves the family.
+
+- `models.toml` is validated rather than asserted. A `$SUPVAN_MODELS` override
+  or an on-disk `models.toml` is operator-supplied, so a mistake in it (a
+  duplicate media size, a ladder step CUPS cannot resolve, an unknown
+  `profile`, a dangling family reference, a media dimension outside
+  1..=10000 mm) is now logged and the registry falls back to the table embedded
+  in the binary, instead of panicking the daemon.
 
 ### Fixed
 

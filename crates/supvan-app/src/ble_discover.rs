@@ -11,6 +11,8 @@
 //! Gated behind the `ble` feature; without it `list_candidates` is a stub that
 //! returns nothing, so discovery wiring compiles on BlueZ-free CI.
 
+use crate::models;
+
 /// One BLE-attached Supvan candidate, ready to cross-correlate with USB/BT.
 #[derive(Debug, Clone)]
 pub struct BleCandidate {
@@ -18,27 +20,12 @@ pub struct BleCandidate {
     pub name: String,
 }
 
-/// Supvan printers advertise a name beginning with a `T`/`G`/`D` model letter
-/// followed by two digits (e.g. `T0182…`, `G15…`).
-#[cfg_attr(not(feature = "ble"), allow(dead_code))]
-fn is_supvan_ble_name(name: &str) -> bool {
-    let b = name.as_bytes();
-    b.len() >= 3
-        && matches!(b[0], b'T' | b'G' | b'D')
-        && b[1].is_ascii_digit()
-        && b[2].is_ascii_digit()
-}
-
-/// Supvan's assigned MAC OUI.
-#[cfg_attr(not(feature = "ble"), allow(dead_code))]
-fn is_supvan_oui(addr: &str) -> bool {
-    addr.len() >= 8 && addr[..8].eq_ignore_ascii_case("A4:93:40")
-}
-
-/// True if a scanned device looks like a Supvan BLE printer.
+/// True if a scanned device looks like a Supvan BLE printer: Supvan's OUI plus
+/// the firmware serial-name shape both scanners share (see
+/// [`crate::models::is_supvan_serial_name`]).
 #[cfg_attr(not(feature = "ble"), allow(dead_code))]
 fn is_supvan_ble(addr: &str, name: &str) -> bool {
-    is_supvan_oui(addr) && is_supvan_ble_name(name)
+    models::is_supvan_oui(addr) && models::is_supvan_serial_name(name)
 }
 
 #[cfg(not(feature = "ble"))]
@@ -90,7 +77,7 @@ async fn scan() -> bluer::Result<Vec<BleCandidate>> {
                 continue;
             };
             let astr = addr.to_string();
-            if !is_supvan_oui(&astr) {
+            if !models::is_supvan_oui(&astr) {
                 continue;
             }
             let Ok(dev) = adapter.device(addr) else {
@@ -145,8 +132,8 @@ mod tests {
 
     #[test]
     fn accepts_g_and_d_families() {
-        assert!(is_supvan_ble_name("G15Mini"));
-        assert!(is_supvan_ble_name("D12foo"));
-        assert!(!is_supvan_ble_name("X12foo"));
+        assert!(is_supvan_ble("A4:93:40:AF:B0:B5", "G15Mini"));
+        assert!(is_supvan_ble("A4:93:40:AF:B0:B5", "D12foo"));
+        assert!(!is_supvan_ble("A4:93:40:AF:B0:B5", "X12foo"));
     }
 }

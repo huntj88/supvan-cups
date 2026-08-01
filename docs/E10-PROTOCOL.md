@@ -163,6 +163,9 @@ The constraint is entirely CUPS-side, and it is sharper than it looks:
 - CUPS truncates the PPD it generates somewhere past ~470 sizes: 999 advertised
   produced 410, with the last contiguous rung at 471. An over-long list would
   therefore advertise lengths that crash the filter when a client picks one.
+  The cap counts *advertised sizes*, not rungs: the ladder repeats every rung
+  once per width in `media_ladder.widths`, so the budget a band is checked
+  against is `400 / widths.len()` lengths.
 
 So the length a caller can obtain is whatever `media_mm` and `media_ladder` in
 `data/models.toml` enumerate. That is why the E-series family carries a ladder

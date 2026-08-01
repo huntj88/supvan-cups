@@ -573,8 +573,8 @@ mod tests {
                 "{name} is an E-series unit"
             );
         }
-        // Pins nothing — its hardware code isn't listed, so it could be an
-        // E-series unit the registry doesn't know about yet.
+        // Pins nothing — reached discovery via the generic serial-name
+        // fallback, so it could be an E-series unit with an unlisted code.
         for name in ["T0199Z2501010001", "D42unknown", ""] {
             assert!(
                 b.needs_model_probe(&candidate(name)),

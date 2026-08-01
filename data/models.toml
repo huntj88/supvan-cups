@@ -38,6 +38,23 @@ media_mm = [
     [20, 20], [20, 30], [20, 40],
     [25, 30], [25, 40], [25, 50],
 ]
+# Continuous tape: there is no die-cut gap to register against, so the printed
+# length is simply how many columns the driver ships, and any length is legal.
+# CUPS can only request a size the PPD enumerates — and one it does not know
+# crashes the `universal` filter rather than falling back — so this ladder is
+# the set of lengths a caller is allowed to ask for. Fine at the bottom, where
+# a one-word label lives and the relative waste is largest.
+#
+# 2 mm is the floor for the step: at 1 mm spacing CUPS delivers a raster one
+# millimetre short of the size that was asked for (measured: 15x20mm -> 152
+# instead of 160 columns), which silently clips the trailing edge. At 2 mm
+# every rung arrives exact. See docs/E10-PROTOCOL.md §4.1.2.
+media_ladder = { widths = [12, 15, 20, 25], from = 4, steps = [
+    { to = 60, step = 2 },
+    { to = 120, step = 5 },
+    { to = 300, step = 20 },
+    { to = 1000, step = 50 },
+] }
 
 [[families]]
 name = "supvan_t80"
@@ -224,7 +241,10 @@ family = "supvan_sp650"
 # always accepted for discovery but don't select a specific family.
 #
 # `t0117`/`t0143`-style entries are firmware *hardware codes* from the serial
-# name a printer broadcasts over BT (e.g. `T0143F2408183024` = E10).
+# name a printer broadcasts over BT (e.g. `T0143F2408183024` = E10). Codes not
+# listed here still pass discovery via the generic `is_supvan_serial_name`
+# fallback (Supvan OUI + `[TGD]\d\d` name) and land on the default family —
+# list them here only to pin a non-default family.
 
 [bt_patterns]
 supvan_t50 = ["t50", "t0117"]
