@@ -7,6 +7,41 @@ minor version).
 
 ## [Unreleased]
 
+### Fixed
+
+- **24-bit sRGB rasters printed as a solid black label.** The IPP layer
+  advertises `SRGB24` in its URF list, so anything that goes through
+  Ghostscript — which is the normal path for a text label — arrives as 24 bpp,
+  not 8-bit grey. Only the 8 bpp case was dithered; 24 bpp fell through to the
+  1-bit copy path, which sized the page buffer from the *incoming*
+  `bytes_per_line` (360 for a 120-dot line rather than 15) and then copied raw
+  RGB into the bitmap, where white `0xFF` bytes became eight set dots. Contone
+  input of any depth is now flattened to grey (Rec. 709 luma, matching the
+  `image/jpeg` path so a picture prints the same either way) and dithered, and
+  an unsupported depth is a clear error rather than silent ink.
+
+- **A padded 1 bpp scanline sheared the page.** The page buffer is re-read by
+  `raster_to_column_major` at a hard-coded `ceil(width/8)` stride, but it was
+  allocated from the source's `bytes_per_line` whenever the input was already
+  1 bpp. CUPS is free to pad a row out past the page width, and every row after
+  the first then started at the wrong offset. The buffer is now packed to
+  `ceil(width/8)` for every depth, and `append_line` drops the source padding
+  as the row arrives.
+
+- `center_in_printhead` now crops a page wider than the printhead
+  symmetrically instead of keeping its leading bytes. The media runs centred
+  under the head, so the old behaviour dropped one whole edge — the T50 family
+  advertises 50 mm media on a 48 mm head, which lost 2 mm off the right rather
+  than 1 mm off each side. CUPS renders the full media width because the IPP
+  layer declares zero hard margins on all four sides, so the crop cannot be
+  avoided upstream.
+
+- Both the crop window and the centring offset are now measured against the
+  head's *usable* width (`printhead_dots / 8 * 8`), which is what the output
+  buffer holds. The G series is 190 dots, where walking the nominal width ran
+  off the end of the last column: silent corruption of the next column for
+  every column but the last, and an out-of-bounds panic on it.
+
 ## [0.5.1] - 2026-07-01
 
 ### Added

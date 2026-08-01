@@ -52,8 +52,14 @@ pub fn raster_to_column_major(input: &[u8], width: u32, height: u32) -> (Vec<u8>
 
 /// Center image data in a full-width printhead canvas.
 ///
-/// The T50 Pro always uses a 48mm (384 dot) canvas regardless of actual
-/// label width. The image content is centered within this canvas.
+/// The printhead is a fixed physical bar (384 dots / 48 mm on the T50) and the
+/// media runs centred under it, so a page is always placed centred in a
+/// head-width canvas regardless of the label's own width.
+///
+/// A page *wider* than the head is cropped symmetrically rather than padded.
+/// That is reachable in normal operation — the T50 family advertises 50 mm
+/// media on a 48 mm head — and CUPS renders the full media width because the
+/// IPP layer declares zero hard margins on all four sides.
 ///
 /// Input: column-major LSB-first data with `input_bytes_per_line` per column.
 /// Output: column-major LSB-first data with `canvas_bytes_per_line` per column.
@@ -65,23 +71,47 @@ pub fn center_in_printhead(
 ) -> (Vec<u8>, u32) {
     let canvas_bytes_per_line = (canvas_width_dots / 8) as usize;
     let input_bytes_per_line = input_width_dots.div_ceil(8) as usize;
+    // A head whose width isn't a whole number of bytes (the G series is 190
+    // dots) can only carry `canvas_bytes_per_line * 8`. Every dot decision
+    // below measures against that, not the nominal width, which would walk
+    // off the end of the last column.
+    let usable_width_dots = (canvas_bytes_per_line * 8) as u32;
 
-    if input_width_dots >= canvas_width_dots {
-        // Input already fills or exceeds canvas - just truncate width
+    if input_width_dots >= usable_width_dots {
+        // Wider than the head: keep the *middle* of the image, because the
+        // media runs centred under the printhead. Copying the leading bytes
+        // instead drops one whole edge — a 50 mm label on the T50's 48 mm
+        // head lost 2 mm off the right rather than 1 mm off each side.
+        let lost = input_width_dots - usable_width_dots;
+        if lost > 0 {
+            let left = lost / 2;
+            log::warn!(
+                "center_in_printhead: image is {input_width_dots} dots but the head can \
+                 carry {usable_width_dots} (nominal {canvas_width_dots}); cropping {lost} \
+                 dots ({left} left, {} right)",
+                lost - left
+            );
+        }
+        let x_offset_dots = lost / 2;
         let mut output = vec![0u8; num_cols as usize * canvas_bytes_per_line];
         for col in 0..num_cols as usize {
-            let in_start = col * input_bytes_per_line;
-            let out_start = col * canvas_bytes_per_line;
-            let copy_len = canvas_bytes_per_line.min(input_bytes_per_line);
-            if in_start + copy_len <= input.len() {
-                output[out_start..out_start + copy_len]
-                    .copy_from_slice(&input[in_start..in_start + copy_len]);
+            for dot in 0..usable_width_dots {
+                // The crop offset is rarely byte-aligned, so shift bit by bit.
+                let src_dot = x_offset_dots + dot;
+                let in_byte = col * input_bytes_per_line + (src_dot / 8) as usize;
+                if in_byte >= input.len() {
+                    continue;
+                }
+                if (input[in_byte] >> (src_dot % 8)) & 1 != 0 {
+                    let out_byte = col * canvas_bytes_per_line + (dot / 8) as usize;
+                    output[out_byte] |= 1 << (dot % 8);
+                }
             }
         }
         return (output, canvas_bytes_per_line as u32);
     }
 
-    let x_offset_dots = (canvas_width_dots - input_width_dots) / 2;
+    let x_offset_dots = (usable_width_dots - input_width_dots) / 2;
     let mut output = vec![0u8; num_cols as usize * canvas_bytes_per_line];
 
     for col in 0..num_cols as usize {
@@ -233,5 +263,78 @@ mod tests {
         assert_eq!(h, 240);
         assert_eq!(bpl, 48);
         assert_eq!(data.len(), 240 * 48);
+    }
+
+    /// A page wider than the head must lose the same amount from both sides,
+    /// because the media runs centred under the printhead. Taking the leading
+    /// bytes instead drops one edge entirely — a 50 mm label on the T50's
+    /// 48 mm head lost 2 mm off the right rather than 1 mm off each side.
+    #[test]
+    fn oversized_input_is_cropped_symmetrically() {
+        // One column, 120 dots wide: set only the outermost dot on each side.
+        let input_w = 120u32;
+        let head_w = 96u32;
+        let bpl = (input_w / 8) as usize;
+        let mut input = vec![0u8; bpl];
+        let set = |buf: &mut [u8], dot: u32| buf[(dot / 8) as usize] |= 1 << (dot % 8);
+        set(&mut input, 0);
+        set(&mut input, input_w - 1);
+        // ... and one dot just inside the expected crop window on each side.
+        let margin = (input_w - head_w) / 2; // 12
+        set(&mut input, margin);
+        set(&mut input, input_w - 1 - margin);
+
+        let (out, out_bpl) = center_in_printhead(&input, 1, input_w, head_w);
+        assert_eq!(out_bpl, head_w / 8);
+        let get = |buf: &[u8], dot: u32| (buf[(dot / 8) as usize] >> (dot % 8)) & 1 == 1;
+
+        // The two outermost dots fall outside the window and are dropped.
+        // The two just inside it survive, landing at the window's edges.
+        assert!(
+            get(&out, 0),
+            "dot {margin} should map to the first head dot"
+        );
+        assert!(
+            get(&out, head_w - 1),
+            "the mirror-side dot should survive too"
+        );
+        // Nothing else should have been lit.
+        let lit = (0..head_w).filter(|d| get(&out, *d)).count();
+        assert_eq!(lit, 2, "exactly the two in-window dots should be set");
+    }
+
+    /// A head whose width is not a whole number of bytes — the G series is
+    /// 190 dots — carries only `190 / 8 * 8 = 184` of them, because that is
+    /// all the returned buffer has room for. Walking the nominal 190 wrote
+    /// past the end of the last column: silent corruption of the next column
+    /// for every column but the last, and an index-out-of-bounds panic on it.
+    #[test]
+    fn head_width_that_is_not_a_whole_number_of_bytes_stays_in_bounds() {
+        const HEAD: u32 = 190;
+        const COLS: u32 = 3;
+        let in_bpl = HEAD.div_ceil(8) as usize;
+        // Light every dot, so any reachable output byte would be written.
+        let input = vec![0xffu8; COLS as usize * in_bpl];
+
+        let (out, out_bpl) = center_in_printhead(&input, COLS, HEAD, HEAD);
+        assert_eq!(out_bpl, 23, "184 usable dots, not 190");
+        assert_eq!(out.len(), COLS as usize * 23);
+        // Exactly the usable dots, and no bleed into a neighbouring column.
+        assert!(out.iter().all(|&b| b == 0xff));
+    }
+
+    /// The same head must also centre a narrower page inside its *usable*
+    /// width rather than its nominal one, or the guard in the centring branch
+    /// silently eats the dots past 184.
+    #[test]
+    fn undersized_input_centres_within_the_usable_head_width() {
+        const HEAD: u32 = 190;
+        let input = vec![0xffu8; 2]; // 16 dots
+        let (out, out_bpl) = center_in_printhead(&input, 1, 16, HEAD);
+        assert_eq!(out_bpl, 23);
+        let lit = (0..23 * 8)
+            .filter(|d| (out[d / 8] >> (d % 8)) & 1 == 1)
+            .count();
+        assert_eq!(lit, 16, "every input dot lands inside the usable width");
     }
 }

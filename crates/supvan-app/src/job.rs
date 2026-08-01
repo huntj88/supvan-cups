@@ -9,7 +9,7 @@ use supvan_proto::error::Error as ProtoError;
 use supvan_proto::speed::calc_speed;
 use supvan_proto::status::PrinterStatus;
 
-use crate::dither::dither_line;
+use crate::dither::{dither_line, to_gray_line};
 use crate::dump::{JobDump, JobManifest, PgmAccumulator, dumps_enabled};
 use crate::mock;
 use crate::printer_device::KsDevice;
@@ -87,16 +87,34 @@ pub struct KsJob {
 }
 
 impl KsJob {
+    /// Allocate the page buffer for an incoming raster.
+    ///
+    /// The buffer is always tightly packed 1 bpp at `ceil(w/8)`, whatever the
+    /// source says: contone lines are dithered before `append_line`, and
+    /// [`raster_to_column_major`] re-reads the buffer at that same hard-coded
+    /// stride. Sizing from `src_bytes_per_line` instead copies raw RGB into
+    /// the bitmap (white `0xFF` becomes eight set dots — a black label), or,
+    /// for a padded 1 bpp source, shears every row. `append_line` truncates
+    /// the padding away as each line arrives.
     pub fn start(
         _dev: &KsDevice,
         w: u32,
         h: u32,
-        bpl: u32,
+        src_bits_per_pixel: u32,
+        src_bytes_per_line: u32,
         density: u8,
         printhead_width_dots: u32,
     ) -> Result<Self, JobFailure> {
+        let bpl = w.div_ceil(8);
+        if src_bits_per_pixel == 1 && src_bytes_per_line > bpl {
+            log::debug!(
+                "KsJob::start: source rows are padded to {src_bytes_per_line} bytes, \
+                 packing to {bpl}"
+            );
+        }
         log::info!(
-            "KsJob::start: {w}x{h}, bpl={bpl}, density={density}, printhead={printhead_width_dots}"
+            "KsJob::start: {w}x{h}, {src_bits_per_pixel}bpp in, bpl={bpl}, \
+             density={density}, printhead={printhead_width_dots}"
         );
         Ok(KsJob {
             width: w,
@@ -261,40 +279,50 @@ impl RasterDriver for KsJob {
     ) -> Result<Self, JobFailure> {
         let w = options.width;
         let h = options.height;
-        let bpl = if options.bits_per_pixel == 8 {
-            w.div_ceil(8)
-        } else {
-            options.bytes_per_line
-        };
 
         let darkness = printer.darkness();
         // darkness is 0-100%; scale to 0-MAX_DENSITY, rounding to nearest.
         let density = ((darkness * MAX_DENSITY + 50) / 100) as u8;
         let printhead_width_dots = printer.printhead_width_dots();
 
-        let mut ks = KsJob::start(dev, w, h, bpl, density, printhead_width_dots)?;
-        if options.bits_per_pixel == 8 && dumps_enabled() {
+        let mut ks = KsJob::start(
+            dev,
+            w,
+            h,
+            options.bits_per_pixel,
+            options.bytes_per_line,
+            density,
+            printhead_width_dots,
+        )?;
+        if options.bits_per_pixel > 1 && dumps_enabled() {
             ks.pgm_acc = Some(PgmAccumulator::new(w, h));
         }
         Ok(ks)
     }
 
     fn write_line(&mut self, options: &JobOptions, y: u32, line: &[u8]) -> Result<(), JobFailure> {
-        if options.bits_per_pixel == 8 {
+        // Anything deeper than 1 bpp is a contone raster we have to dither
+        // down to the printhead's 1-bit dots.
+        if let Some(input) = to_gray_line(options.bits_per_pixel, line, options.width) {
             let width = options.width;
-            let input = &line[..(width as usize).min(line.len())];
             if let Some(ref mut acc) = self.pgm_acc {
-                acc.push_line(y, input);
+                acc.push_line(y, &input);
             }
             let bpl_1bpp = width.div_ceil(8) as usize;
             let mut mono = vec![0u8; bpl_1bpp];
-            dither_line(input, width, y, &mut mono);
+            dither_line(&input, width, y, &mut mono);
             if !self.append_line(y, &mono) {
                 return Err(JobFailure::other(format!(
                     "write_line: y={y} out of bounds"
                 )));
             }
             return Ok(());
+        }
+        if options.bits_per_pixel != 1 {
+            return Err(JobFailure::other(format!(
+                "write_line: unsupported raster depth {} bpp",
+                options.bits_per_pixel
+            )));
         }
         if !self.append_line(y, line) {
             return Err(JobFailure::other(format!(
@@ -323,5 +351,50 @@ impl RasterDriver for KsJob {
 
     async fn end_job(self, dev: &Self::Device) {
         self.end(dev).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CUPS may pad a 1 bpp scanline wider than the page needs; keeping that
+    /// padding shears every row, since `raster_to_column_major` re-reads the
+    /// buffer at `ceil(width/8)`.
+    #[test]
+    fn start_packs_padded_1bpp_rows_to_the_page_stride() {
+        let dev = KsDevice::open_mock();
+        let (w, h) = (100u32, 4u32);
+        let packed = w.div_ceil(8); // 13
+        let padded = 16; // what CUPS handed us
+
+        let mut ks = KsJob::start(&dev, w, h, 1, padded, 0, 128).unwrap();
+        assert_eq!(ks.bytes_per_line, packed);
+        assert_eq!(ks.raster_data.len(), (h * packed) as usize);
+
+        // Every row arrives at the source stride, with the padding set.
+        for y in 0..h {
+            let mut line = vec![0x00u8; padded as usize];
+            line[0] = 0xA5;
+            for b in line.iter_mut().skip(packed as usize) {
+                *b = 0xFF;
+            }
+            assert!(ks.append_line(y, &line));
+        }
+
+        // Each row starts where the packed stride says it does, and none of
+        // the source padding leaked in.
+        for y in 0..h {
+            let row = &ks.raster_data[(y * packed) as usize..((y + 1) * packed) as usize];
+            assert_eq!(row[0], 0xA5, "row {y} misaligned");
+            assert!(row[1..].iter().all(|&b| b == 0x00), "row {y} kept padding");
+        }
+    }
+
+    #[test]
+    fn start_sizes_contone_pages_from_the_dithered_width() {
+        let dev = KsDevice::open_mock();
+        let ks = KsJob::start(&dev, 100, 4, 24, 300, 0, 128).unwrap();
+        assert_eq!(ks.bytes_per_line, 13);
     }
 }
